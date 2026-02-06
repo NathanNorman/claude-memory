@@ -1,0 +1,24 @@
+{
+  "name": "claude-memory",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "@xenova/transformers": "^2.17.2",
+    "better-sqlite3": "^12.4.1",
+    "sqlite-vec": "^0.1.7-alpha.2",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.7.0",
+    "esbuild": "^0.25.11",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "build": "esbuild src/server.ts --bundle --platform=node --format=esm --outfile=dist/server.js --external:better-sqlite3 --external:sqlite-vec --external:@xenova/transformers --external:fsevents",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js",
+    "test": "tsc && node --test dist/integration.test.js"
+  }
+}
