@@ -154,6 +154,10 @@ export function searchKeyword(
 
 // --- Hybrid Search ---
 
+function log(msg: string): void {
+  process.stderr.write(`[claude-memory] ${msg}\n`);
+}
+
 export function searchHybrid(
   db: DatabaseType,
   queryEmbedding: Float32Array,
@@ -163,8 +167,27 @@ export function searchHybrid(
 ): SearchResult[] {
   // Fetch limit*4 candidates from each backend for better hybrid recall
   const candidateCount = limit * 4;
-  const vectorHits = searchVector(db, queryEmbedding, candidateCount);
-  const keywordHits = searchKeyword(db, query, candidateCount);
+
+  // Both vec0 and FTS5 can fail when concurrent processes corrupt their
+  // internal data structures. Catch errors from each independently so
+  // search degrades gracefully instead of failing entirely.
+  let vectorHits: SearchResult[];
+  try {
+    vectorHits = searchVector(db, queryEmbedding, candidateCount);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`Vector search failed (falling back to keyword-only): ${msg}`);
+    vectorHits = [];
+  }
+
+  let keywordHits: SearchResult[];
+  try {
+    keywordHits = searchKeyword(db, query, candidateCount);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(`Keyword search failed (falling back to vector-only): ${msg}`);
+    keywordHits = [];
+  }
   const merged = mergeHybridResults(vectorHits, keywordHits);
   let results = merged.filter((r) => r.score >= threshold).slice(0, limit);
 

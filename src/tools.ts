@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, openSync, closeSync, unlinkSync, constants as fsConstants } from 'node:fs';
 import { join, resolve, normalize, dirname } from 'node:path';
 import type { Database as DatabaseType } from 'better-sqlite3';
 import { z } from 'zod';
@@ -75,6 +75,50 @@ export function closeDb(): void {
       // DB may already be closed
     }
     db = null;
+  }
+}
+
+// --- Reindex File Lock ---
+// Multiple MCP server processes (one per Claude Code session/agent) share
+// the same SQLite database. sqlite-vec's vec0 virtual table doesn't handle
+// concurrent writes well. Use a lockfile so only one process reindexes at
+// a time; others skip if the lock is held.
+
+const LOCK_PATH = join(
+  process.env['HOME'] ?? process.env['USERPROFILE'] ?? '.',
+  '.claude-memory',
+  'index',
+  'reindex.lock',
+);
+
+function acquireReindexLock(): boolean {
+  try {
+    const fd = openSync(LOCK_PATH, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
+    writeFileSync(fd, `${process.pid}\n${Date.now()}\n`);
+    closeSync(fd);
+    return true;
+  } catch {
+    // Lock file exists — check if it's stale (older than 5 minutes)
+    try {
+      const content = readFileSync(LOCK_PATH, 'utf-8');
+      const timestamp = parseInt(content.split('\n')[1] ?? '0', 10);
+      if (Date.now() - timestamp > 5 * 60 * 1000) {
+        // Stale lock, remove and retry
+        unlinkSync(LOCK_PATH);
+        return acquireReindexLock();
+      }
+    } catch {
+      // Can't read lock file, assume it's held
+    }
+    return false;
+  }
+}
+
+function releaseReindexLock(): void {
+  try {
+    unlinkSync(LOCK_PATH);
+  } catch {
+    // Lock file may already be removed
   }
 }
 
@@ -198,9 +242,18 @@ export async function handleMemorySearch(args: {
 }): Promise<{ results: SearchResultEntry[] }> {
   const database = getDb();
 
-  // Only reindex if files have changed (mtime-based staleness check)
+  // Only reindex if files have changed (mtime-based staleness check).
+  // Acquire a file lock so only one process reindexes at a time —
+  // sqlite-vec's vec0 table corrupts under concurrent writes.
   if (isIndexStale(database, MEMORY_DIR, ARCHIVE_DIR)) {
-    await indexAll(database, MEMORY_DIR, ARCHIVE_DIR);
+    if (acquireReindexLock()) {
+      try {
+        await indexAll(database, MEMORY_DIR, ARCHIVE_DIR);
+      } finally {
+        releaseReindexLock();
+      }
+    }
+    // If lock not acquired, skip reindex — another process is handling it
   }
 
   // Over-fetch to compensate for post-filtering (date, project, source, session dedup)
@@ -416,9 +469,16 @@ export async function handleMemoryWrite(args: {
     writeFileSync(fullPath, args.content, 'utf-8');
   }
 
-  // Trigger reindex (always after write, discard stats)
+  // Trigger reindex (always after write)
   const database = getDb();
-  await indexAll(database, MEMORY_DIR, ARCHIVE_DIR);
+  if (acquireReindexLock()) {
+    try {
+      await indexAll(database, MEMORY_DIR, ARCHIVE_DIR);
+    } finally {
+      releaseReindexLock();
+    }
+  }
+  // If lock not acquired, another process will pick up the changes
 
   const linesWritten = args.content.split('\n').length;
 

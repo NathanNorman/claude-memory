@@ -131,11 +131,15 @@ export function insertChunk(db: DatabaseType, chunk: MemoryChunk): void {
   const rowid = row.rowid;
 
   // Sync FTS5: delete old entry then insert new
-  db.prepare(`INSERT OR REPLACE INTO chunks_fts(rowid, content, title) VALUES (?, ?, ?)`).run(
-    rowid,
-    chunk.content,
-    chunk.title,
-  );
+  try {
+    db.prepare(`INSERT OR REPLACE INTO chunks_fts(rowid, content, title) VALUES (?, ?, ?)`).run(
+      rowid,
+      chunk.content,
+      chunk.title,
+    );
+  } catch {
+    // FTS5 can be corrupted by concurrent access; safe to skip
+  }
 
   // Sync vec0: delete old entry then insert new (sqlite-vec requires BigInt for rowid)
   try {
@@ -154,7 +158,11 @@ export function deleteChunksByFile(db: DatabaseType, filePath: string): void {
   const rows = db.prepare(`SELECT rowid FROM chunks WHERE file_path = ?`).all(filePath) as { rowid: number }[];
 
   for (const row of rows) {
-    db.prepare(`DELETE FROM chunks_fts WHERE rowid = ?`).run(row.rowid);
+    try {
+      db.prepare(`DELETE FROM chunks_fts WHERE rowid = ?`).run(row.rowid);
+    } catch {
+      // FTS5 can be corrupted by concurrent access; safe to skip
+    }
     try {
       db.prepare(`DELETE FROM chunks_vec WHERE rowid = ?`).run(BigInt(row.rowid));
     } catch {

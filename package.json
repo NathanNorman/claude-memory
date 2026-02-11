@@ -16,7 +16,8 @@
     "typescript": "^5.9.3"
   },
   "scripts": {
-    "build": "esbuild src/server.ts --bundle --platform=node --format=esm --outfile=dist/server.js --external:better-sqlite3 --external:sqlite-vec --external:@xenova/transformers --external:fsevents",
+    "build": "esbuild src/server.ts --bundle --platform=node --format=esm --outfile=dist/server.js --external:better-sqlite3 --external:sqlite-vec --external:@xenova/transformers --external:fsevents && npm run build:doctor",
+    "build:doctor": "esbuild src/doctor-cli.ts --bundle --platform=node --format=esm --outfile=dist/doctor-cli.js --external:better-sqlite3 --external:sqlite-vec --external:@xenova/transformers --external:fsevents",
     "typecheck": "tsc --noEmit",
     "start": "node dist/server.js",
     "test": "tsc && node --test dist/integration.test.js"
