@@ -76,7 +76,7 @@ The numpy matrix gets rebuilt on next search call (it's lazy-loaded and could be
 
 ```python
 # Instead of: import sqlite_vec; sqlite_vec.load(conn)
-# Do: conn.load_extension('/Users/nathan.norman/claude-memory/node_modules/sqlite-vec/vec0')
+# Do: conn.load_extension('~/claude-memory/node_modules/sqlite-vec/vec0')
 ```
 
 **(B) Build sqlite-vec from source for Python 3.12.** The pip package may have a newer release that works. Check `pip install sqlite-vec --upgrade` or build from the GitHub repo.

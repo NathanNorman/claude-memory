@@ -1,4 +1,4 @@
-#!/Users/nathan.norman/.claude-memory/graphiti-venv/bin/python3
+#!/usr/bin/env python3
 """
 Background script called by graphiti-session-ingest.py hook.
 Parses a single conversation transcript and ingests it into Graphiti.

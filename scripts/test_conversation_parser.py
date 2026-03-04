@@ -1,4 +1,4 @@
-#!/Users/nathan.norman/.pyenv/versions/3.10.14/bin/python3
+#!/usr/bin/env python3
 """
 Smoke tests for conversation_parser.py.
 
