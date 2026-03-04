@@ -3,15 +3,13 @@
 Unified Memory MCP Server
 
 Combines flat text search (SQLite FTS5) with local vector search
-(sqlite-vec + sentence-transformers) and optional knowledge graph search
-(FalkorDB/Graphiti) for hybrid retrieval. A single MCP server
-that replaces both claude-memory and graphiti-memory.
+(sentence-transformers, 384-dim all-MiniLM-L6-v2) for hybrid retrieval.
+A single MCP server for persistent memory across Claude Code sessions.
 
 Architecture:
   - Flat backend: Opens claude-memory's SQLite DB, runs FTS5 keyword search
-  - Vector backend: Queries sqlite-vec (384-dim all-MiniLM-L6-v2 embeddings)
-  - Graph backend: Uses graphiti_core to query FalkorDB for entities/facts
-  - Hybrid retrieval: RRF merge of keyword + vector + graph-expanded results
+  - Vector backend: Brute-force cosine similarity over pre-computed embeddings
+  - Hybrid retrieval: RRF merge of keyword + vector results
   - Graceful degradation: Each backend can fail independently
 """
 
@@ -39,7 +37,6 @@ HOME = Path.home()
 MEMORY_DIR = HOME / '.claude-memory'
 DB_PATH = MEMORY_DIR / 'index' / 'memory.db'
 ARCHIVE_DIR = HOME / '.claude' / 'projects'
-GRAPHITI_CONFIG = MEMORY_DIR / 'graphiti-config' / 'config.yaml'
 CONV_PREFIX = 'conversations/'
 
 logging.basicConfig(
@@ -498,6 +495,57 @@ class VectorSearchBackend:
                 })
         return results
 
+    def embed_written_chunks(self, file_path_relative: str) -> int:
+        """Generate embeddings for newly written chunks and invalidate cache.
+
+        Called after FlatSearchBackend.index_written_file() writes chunks to
+        the DB with NULL embeddings. Reads those chunks, embeds them with the
+        same model the Node.js indexer uses, writes BLOB back to chunks.embedding.
+
+        Returns count of chunks embedded.
+        """
+        conn = self._ensure_conn()
+        if conn is None:
+            return 0
+
+        model = self._ensure_model()
+        if model is None:
+            return 0
+
+        rows = conn.execute(
+            'SELECT rowid, content FROM chunks '
+            'WHERE file_path = ? AND embedding IS NULL',
+            (file_path_relative,),
+        ).fetchall()
+
+        if not rows:
+            return 0
+
+        texts = [row['content'] for row in rows]
+        try:
+            embeddings = model.encode(texts, normalize_embeddings=True)
+        except Exception as e:
+            log.warning(f'Embedding generation failed: {e}')
+            return 0
+
+        count = 0
+        for row, emb in zip(rows, embeddings):
+            blob = struct.pack(f'{self.EMBEDDING_DIMS}f', *emb.tolist())
+            conn.execute(
+                'UPDATE chunks SET embedding = ? WHERE rowid = ?',
+                (blob, row['rowid']),
+            )
+            count += 1
+
+        conn.commit()
+
+        # Invalidate in-memory matrix so next search reloads
+        self._matrix = None
+        self._rowids = None
+
+        log.info(f'Embedded {count} chunks for {file_path_relative}')
+        return count
+
     def get_stats(self) -> dict:
         """Get vector index statistics."""
         conn = self._ensure_conn()
@@ -529,206 +577,7 @@ class VectorSearchBackend:
 
 
 # ──────────────────────────────────────────────────────────────
-# Section 2: GraphSearchBackend — FalkorDB / Graphiti
-# ──────────────────────────────────────────────────────────────
-
-
-class GraphSearchBackend:
-    """Lazy-init graph search via Graphiti + FalkorDB.
-
-    Doesn't connect until first query (lazy init). If FalkorDB is not
-    running or OpenAI key is missing, marks itself as failed and returns
-    empty results for all subsequent calls.
-    """
-
-    def __init__(self, config_path: Path):
-        self.config_path = config_path
-        self._client = None
-        self._group_id = 'claude-memory'
-        self._initialized = False
-        self._init_failed = False
-
-    async def _ensure_client(self):
-        """Lazy initialization of Graphiti client."""
-        if self._initialized:
-            return self._client
-        if self._init_failed:
-            return None
-
-        try:
-            import yaml
-            from graphiti_core import Graphiti
-            from graphiti_core.driver.falkordb_driver import FalkorDriver
-            from graphiti_core.embedder.openai import (
-                OpenAIEmbedder,
-                OpenAIEmbedderConfig,
-            )
-            from graphiti_core.llm_client import OpenAIClient
-            from graphiti_core.llm_client.config import LLMConfig as CoreLLMConfig
-
-            with open(self.config_path) as f:
-                cfg = yaml.safe_load(f)
-
-            api_key = os.environ.get('OPENAI_API_KEY', '')
-            if not api_key:
-                log.warning('OPENAI_API_KEY not set - graph search disabled')
-                self._init_failed = True
-                return None
-
-            # LLM client
-            llm_model = cfg.get('llm', {}).get('model', 'gpt-4o-mini')
-            llm_config = CoreLLMConfig(
-                api_key=api_key, model=llm_model, small_model=llm_model,
-            )
-            llm_client = OpenAIClient(
-                config=llm_config, reasoning=None, verbosity=None,
-            )
-
-            # Embedder
-            embed_model = cfg.get('embedder', {}).get('model', 'text-embedding-3-small')
-            embedder = OpenAIEmbedder(config=OpenAIEmbedderConfig(
-                api_key=api_key, embedding_model=embed_model,
-            ))
-
-            # FalkorDB driver
-            from urllib.parse import urlparse
-
-            self._group_id = cfg.get('graphiti', {}).get('group_id', 'claude-memory')
-
-            db_cfg = cfg.get('database', {}).get('providers', {}).get('falkordb', {})
-            uri = db_cfg.get('uri', 'redis://localhost:6379')
-            parsed = urlparse(uri)
-
-            driver = FalkorDriver(
-                host=parsed.hostname or 'localhost',
-                port=parsed.port or 6379,
-                password=None,
-                database=db_cfg.get('database', self._group_id),
-            )
-
-            self._client = Graphiti(
-                graph_driver=driver,
-                llm_client=llm_client,
-                embedder=embedder,
-            )
-            self._initialized = True
-            log.info('Graph backend initialized')
-            return self._client
-
-        except Exception as e:
-            log.warning(f'Graph backend init failed: {e}')
-            self._init_failed = True
-            return None
-
-    async def search_nodes(self, query: str, max_results: int = 5) -> list[dict]:
-        """Search for entity nodes in the knowledge graph."""
-        client = await self._ensure_client()
-        if not client:
-            return []
-        try:
-            from graphiti_core.search.search_config_recipes import (
-                NODE_HYBRID_SEARCH_RRF,
-            )
-
-            results = await client.search_(
-                query=query,
-                config=NODE_HYBRID_SEARCH_RRF,
-                group_ids=[self._group_id],
-            )
-            nodes = (results.nodes or [])[:max_results]
-            return [
-                {
-                    'name': n.name,
-                    'type': n.labels[0] if n.labels else 'Entity',
-                    'summary': n.summary or '',
-                }
-                for n in nodes
-            ]
-        except Exception as e:
-            log.warning(f'Graph node search failed: {e}')
-            return []
-
-    async def search_facts(self, query: str, max_results: int = 5) -> list[dict]:
-        """Search for relationship facts in the knowledge graph."""
-        client = await self._ensure_client()
-        if not client:
-            return []
-        try:
-            edges = await client.search(
-                group_ids=[self._group_id],
-                query=query,
-                num_results=max_results,
-            )
-            return [
-                {
-                    'fact': e.fact or '',
-                    'source': e.source_node_name or '',
-                    'target': e.target_node_name or '',
-                }
-                for e in (edges or [])
-            ]
-        except Exception as e:
-            log.warning(f'Graph fact search failed: {e}')
-            return []
-
-    async def add_episode(
-        self, name: str, body: str, source_desc: str = '',
-    ) -> bool:
-        """Add an episode to the knowledge graph."""
-        client = await self._ensure_client()
-        if not client:
-            return False
-        try:
-            from graphiti_core.nodes import EpisodeType
-
-            await client.add_episode(
-                name=name,
-                episode_body=body,
-                source=EpisodeType.text,
-                source_description=source_desc,
-                group_id=self._group_id,
-                reference_time=datetime.now(),
-            )
-            return True
-        except Exception as e:
-            log.warning(f'Graph episode add failed: {e}')
-            return False
-
-    async def health_check(self) -> dict:
-        """Test graph database connectivity and return stats."""
-        client = await self._ensure_client()
-        if not client:
-            return {'status': 'unavailable'}
-        try:
-            records, _, _ = await client.driver.execute_query(
-                'MATCH (n:Entity) RETURN count(n) as cnt'
-            )
-            entities = records[0]['cnt'] if records else 0
-
-            records, _, _ = await client.driver.execute_query(
-                'MATCH ()-[r]->() RETURN count(r) as cnt'
-            )
-            rels = records[0]['cnt'] if records else 0
-
-            return {
-                'status': 'ok',
-                'entities': entities,
-                'relationships': rels,
-            }
-        except Exception as e:
-            return {'status': 'error', 'error': str(e)}
-
-    async def close(self) -> None:
-        if self._client:
-            try:
-                await self._client.close()
-            except Exception:
-                pass
-            self._client = None
-
-
-# ──────────────────────────────────────────────────────────────
-# Section 3: Post-filtering helpers (ported from tools.ts)
+# Section 2: Post-filtering helpers (ported from tools.ts)
 # ──────────────────────────────────────────────────────────────
 
 _home_parts = str(HOME).split(os.sep)
@@ -943,36 +792,16 @@ mcp_app = FastMCP(
     'unified-memory',
     instructions=(
         'Unified memory system combining flat text search (SQLite FTS5) with '
-        'knowledge graph search (FalkorDB/Graphiti). Use memory_search for '
+        'vector similarity search (sentence-transformers). Use memory_search for '
         'finding relevant past context, memory_read for reading specific files '
         'or conversation sessions by UUID, memory_write for persisting new '
-        'knowledge, graph_search for direct graph queries, and get_status '
-        'to check backend health.'
+        'knowledge, and get_status to check backend health.'
     ),
 )
 
 # Backends (initialized at startup)
 flat_backend: Optional[FlatSearchBackend] = None
 vector_backend: Optional[VectorSearchBackend] = None
-graph_backend: Optional[GraphSearchBackend] = None
-
-
-async def _graph_search_combined(query: str) -> dict:
-    """Run graph node + fact search in parallel with error isolation."""
-    if not graph_backend:
-        return {'nodes': [], 'facts': []}
-    try:
-        nodes, facts = await asyncio.gather(
-            graph_backend.search_nodes(query, 5),
-            graph_backend.search_facts(query, 5),
-            return_exceptions=True,
-        )
-        return {
-            'nodes': nodes if isinstance(nodes, list) else [],
-            'facts': facts if isinstance(facts, list) else [],
-        }
-    except Exception:
-        return {'nodes': [], 'facts': []}
 
 
 @mcp_app.tool()
@@ -985,11 +814,11 @@ async def memory_search(
     project: str = '',
     source: str = '',
 ) -> dict:
-    """Search memory for relevant content using hybrid flat+graph retrieval.
+    """Search memory for relevant content using hybrid keyword+vector retrieval.
 
-    Combines keyword search over indexed memory files and conversation archives
-    with knowledge graph search for entities and relationships. Graph entities
-    expand the keyword query for better recall.
+    Combines FTS5 keyword search with vector similarity search over indexed
+    memory files and conversation archives. Results merged via Reciprocal
+    Rank Fusion (RRF) for best of both precision and recall.
 
     Args:
         query: Search query text
@@ -1006,9 +835,6 @@ async def memory_search(
     has_filters = bool(after or before or project or source)
     fetch_limit = maxResults * (5 if has_filters else 3)
 
-    # Phase 1: Start graph search (async) while running flat + vector search (sync)
-    graph_task = asyncio.create_task(_graph_search_combined(query))
-
     # Flat keyword search — synchronous but fast (<50ms typically)
     flat_original = flat_backend.search_keyword(query, fetch_limit * 2)
 
@@ -1020,31 +846,13 @@ async def memory_search(
         except Exception as e:
             log.warning(f'Vector search failed: {e}')
 
-    # Wait for graph results with 3s timeout
-    graph_ctx: dict = {'nodes': [], 'facts': []}
-    try:
-        graph_ctx = await asyncio.wait_for(graph_task, timeout=3.0)
-    except asyncio.TimeoutError:
-        log.warning('Graph search timed out (3s)')
-    except Exception as e:
-        log.warning(f'Graph search error: {e}')
-
-    # Phase 2: Merge keyword + vector via RRF, then expand with graph entities
+    # Merge keyword + vector via RRF
     if vector_hits:
         merged = FlatSearchBackend.merge_rrf(flat_original, vector_hits)
     else:
         merged = flat_original
 
-    # Graph entity expansion: run a second keyword search with entity names
-    entity_names = [n['name'] for n in graph_ctx.get('nodes', [])]
-    if entity_names:
-        expanded_query = query + ' ' + ' '.join(entity_names)
-        expanded_hits = flat_backend.search_keyword(expanded_query, fetch_limit * 2)
-        if expanded_hits:
-            merged = FlatSearchBackend.merge_rrf(merged, expanded_hits)
-        # else: keep current merged as-is
-
-    # Phase 3: Post-filter (ported from tools.ts handleMemorySearch)
+    # Post-filter (ported from tools.ts handleMemorySearch)
     norm_project = normalize_project(project) if project else ''
     summary_cache: dict[str, Optional[str]] = {}
     session_counts: dict[str, int] = {}
@@ -1125,16 +933,7 @@ async def memory_search(
 
         filtered.append(entry)
 
-    result: dict[str, Any] = {'results': filtered}
-
-    # Include graph context if available
-    if graph_ctx.get('nodes') or graph_ctx.get('facts'):
-        result['graph_context'] = {
-            'entities': graph_ctx.get('nodes', []),
-            'facts': graph_ctx.get('facts', []),
-        }
-
-    return result
+    return {'results': filtered}
 
 
 @mcp_app.tool()
@@ -1218,9 +1017,8 @@ async def memory_write(
 ) -> dict:
     """Write content to a memory file. Defaults to daily log.
 
-    Writes to the flat file system and updates the FTS5 search index.
-    If the graph backend is available, also ingests the content as a
-    graph episode in the background.
+    Writes to the flat file system, updates the FTS5 search index,
+    and generates vector embeddings for immediate search coverage.
 
     Args:
         content: Content to write
@@ -1250,61 +1048,21 @@ async def memory_write(
         except Exception as e:
             log.warning(f'FTS5 index update after write failed: {e}')
 
-    # Background graph ingestion
-    if graph_backend:
-        asyncio.create_task(_background_graph_ingest(target, content))
+    # Generate embeddings for written chunks (immediate vector coverage)
+    if vector_backend:
+        try:
+            embedded = vector_backend.embed_written_chunks(target)
+            if embedded:
+                log.info(f'Embedded {embedded} chunks on write for {target}')
+        except Exception as e:
+            log.warning(f'Embedding on write failed: {e}')
 
     return {'path': target, 'linesWritten': lines_written}
 
 
-async def _background_graph_ingest(file_path: str, content: str) -> None:
-    """Ingest written content into the knowledge graph in the background."""
-    if not graph_backend:
-        return
-    try:
-        name = f'memory-write: {file_path}'
-        await graph_backend.add_episode(
-            name, content, source_desc=f'Written to {file_path}',
-        )
-    except Exception as e:
-        log.warning(f'Background graph ingest failed: {e}')
-
-
-@mcp_app.tool()
-async def graph_search(
-    query: str,
-    search_type: str = 'facts',
-    max_results: int = 10,
-) -> dict:
-    """Search the knowledge graph directly for entities or facts.
-
-    Use this for structural/relational queries that benefit from the
-    knowledge graph (e.g., "what technologies does toast-analytics use?",
-    "what decisions were made about RRF scoring?").
-
-    Args:
-        query: Search query
-        search_type: "nodes" for entities, "facts" for relationships (default: facts)
-        max_results: Maximum results (default 10)
-    """
-    if not graph_backend:
-        return {'error': 'Graph backend not available'}
-
-    if search_type == 'nodes':
-        nodes = await graph_backend.search_nodes(query, max_results)
-        return {'nodes': nodes}
-    else:
-        facts = await graph_backend.search_facts(query, max_results)
-        return {'facts': facts}
-
-
 @mcp_app.tool()
 async def get_status() -> dict:
-    """Check health status of both memory backends.
-
-    Returns status, chunk/file counts for the flat backend, and
-    entity/relationship counts for the graph backend.
-    """
+    """Check health status of memory backends (flat + vector)."""
     result: dict[str, Any] = {}
 
     if flat_backend:
@@ -1317,18 +1075,6 @@ async def get_status() -> dict:
     else:
         result['vector'] = {'status': 'unavailable'}
 
-    if graph_backend:
-        try:
-            result['graph'] = await asyncio.wait_for(
-                graph_backend.health_check(), timeout=3.0,
-            )
-        except asyncio.TimeoutError:
-            result['graph'] = {'status': 'timeout'}
-        except Exception as e:
-            result['graph'] = {'status': 'error', 'error': str(e)}
-    else:
-        result['graph'] = {'status': 'unavailable'}
-
     return result
 
 
@@ -1338,7 +1084,7 @@ async def get_status() -> dict:
 
 
 async def run() -> None:
-    global flat_backend, vector_backend, graph_backend
+    global flat_backend, vector_backend
 
     # Initialize flat backend
     try:
@@ -1368,15 +1114,6 @@ async def run() -> None:
     except Exception as e:
         log.warning(f'Vector backend init failed: {e}')
         vector_backend = None
-
-    # Register graph backend (lazy init on first query)
-    if GRAPHITI_CONFIG.exists():
-        graph_backend = GraphSearchBackend(GRAPHITI_CONFIG)
-        log.info('Graph backend registered (lazy init on first query)')
-    else:
-        log.info(
-            f'Graph config not found at {GRAPHITI_CONFIG} - graph disabled'
-        )
 
     # Graceful shutdown
     def shutdown(sig=None, frame=None):
