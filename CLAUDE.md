@@ -14,10 +14,13 @@ claude-memory is a persistent memory system for Claude Code, implemented as an M
 ```bash
 # Node.js indexer
 npm install          # Install dependencies
-npm run build        # Build indexer + doctor CLI (esbuild, single-file ESM bundles)
+npm run build        # Build MCP server + doctor CLI (esbuild, single-file ESM bundles → dist/)
 npm run build:doctor # Build doctor CLI only
 npm run typecheck    # TypeScript type checking (tsc --noEmit)
-npm test             # Type check + integration tests (node --test)
+npm test             # tsc compile + integration tests (node --test)
+
+# Reindex (rebuild search index from memory files + conversation archives)
+npx tsc && node dist/reindex-cli.js   # Backs up DB to ~/.claude-memory/backups/ before reindexing
 
 # Python MCP server (uses venv at ~/.claude-memory/graphiti-venv/)
 ~/.claude-memory/graphiti-venv/bin/python3 src/unified_memory_server.py  # Run directly
@@ -27,6 +30,8 @@ python3 -c "import py_compile; py_compile.compile('src/unified_memory_server.py'
 node dist/doctor-cli.js          # Diagnose (read-only)
 node dist/doctor-cli.js --fix    # Diagnose and repair
 ```
+
+**Dual build system**: `npm run build` uses esbuild to create single-file bundles (`dist/server.js`, `dist/doctor-cli.js`). `tsc` (via `npm test` or `npx tsc`) compiles all src/ files individually to `dist/` — this is how `reindex-cli.js` and `integration.test.js` get built. The esbuild bundles are for MCP/CLI distribution; tsc output is for tests and one-off scripts.
 
 Tests use Node.js native test runner (`node:test`). Single test file: `src/integration.test.ts` → `dist/integration.test.js`. No way to run individual tests.
 
@@ -49,13 +54,21 @@ On `memory_write`: content is written to disk, chunked and indexed into FTS5, th
 ### Indexing flow (Node.js)
 
 ```
-reindex-cli.ts / server.ts (on startup)
+reindex-cli.ts (CLI entry point)
   → indexer.ts (file scanning, staleness detection)
     → chunker.ts (markdown heading-aware + conversation exchange-aware)
     → embeddings.ts (Xenova/transformers.js, ONNX, all-MiniLM-L6-v2)
     → conversation-parser.ts (JSONL → structured exchanges)
     → db.ts (SQLite writes: chunks, chunks_fts, chunks_vec, embedding_cache)
 ```
+
+**Indexing is triggered automatically two ways:**
+1. **SessionEnd hook** (`~/.claude/hooks/memory-reindex.py`) — fires async (Popen, detached) after each session
+2. **claude-cron job** (`memory-reindex`, every 30 min) — catch-all for missed sessions
+
+The indexer is incremental: mtime check first, then content hash. Already-indexed files skip in O(1).
+
+**Note:** Only main session files (`<uuid>.jsonl`) are indexed. Agent subagent files (`agent-*.jsonl` in `<uuid>/subagents/`) are intentionally skipped (line 133 of `indexer.ts`).
 
 ### Data directory (`~/.claude-memory/`)
 
@@ -67,14 +80,25 @@ Not in this repo — runtime data only:
 
 ### Database schema (SQLite, WAL mode)
 
-- `chunks` — main content table (id, file_path, chunk_index, start/end_line, title, content, embedding BLOB, hash)
-- `files` — indexed file tracking (file_path, content_hash, last_indexed, chunk_count, summary)
+- `chunks` — main content table (id, file_path, chunk_index, start/end_line, title, content, embedding BLOB, hash, updated_at)
+- `files` — indexed file tracking (file_path, content_hash, last_indexed, chunk_count, summary). The `summary` column was added via migration in `db.ts` and stores episodic-memory summaries for conversations.
 - `chunks_fts` — FTS5 virtual table (content, title; content-sync'd to chunks)
 - `chunks_vec` — vec0 virtual table (embedding float[384]) — written by Node.js indexer
 - `embedding_cache` — keyed by (provider, model, hash) → embedding BLOB
 - `meta` — tracks embedding model version for invalidation
 
 sqlite-vec requires `BigInt` for rowid values in vec0 operations.
+
+### Conversation preservation
+
+Conversation chunks are **never pruned** from the index, even after Claude Code deletes the original `.jsonl` files. The index is the only surviving copy of that knowledge. Only curated memory files (`MEMORY.md`, `memory/*.md`) are pruned when removed from disk. This is enforced in `indexer.ts:indexAll()` — the prune loop skips any path starting with `conversations/`.
+
+### Python scripts (`scripts/`)
+
+Standalone Python utilities, not part of the MCP server or Node.js indexer:
+- `conversation_parser.py` / `shared.py` — JSONL conversation parsing (Python equivalent of `src/conversation-parser.ts`)
+- `ingest_session.py` — One-off session ingestion script
+- `test_conversation_parser.py` — Tests for the Python parser
 
 ## Key Design Decisions
 

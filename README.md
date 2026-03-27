@@ -130,9 +130,16 @@ Multiple Claude Code sessions each spawn their own MCP server process, all shari
 
 - Curated memory files are chunked by markdown headings
 - Conversation archives are parsed into exchange-level chunks (user/assistant pairs)
+- Only main session files (`<uuid>.jsonl`) are indexed; agent subagent files are skipped
 - Embeddings are generated locally using `all-MiniLM-L6-v2` (384-dim, ONNX runtime)
-- Index staleness is checked via file modification times — reindexing only runs when files change
+- Index staleness is checked via file modification times — reindexing only processes changed files
 - Embedding cache table avoids re-embedding unchanged content on reindex
+
+**Automatic indexing** is handled two ways:
+1. A **SessionEnd hook** (`memory-reindex.py`) fires asynchronously after each Claude Code session
+2. A **cron job** (`memory-reindex`) runs every 30 minutes as a catch-all
+
+Manual reindex: `node dist/reindex-cli.js`
 
 ## Tools Reference
 

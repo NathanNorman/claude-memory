@@ -546,12 +546,17 @@ export async function indexAll(
     }
   }
 
-  // --- Prune stale files ---
+  // --- Prune stale MEMORY files only ---
+  // NEVER prune conversation chunks — Claude Code deletes old .jsonl files,
+  // but the index is the only surviving copy of that knowledge.
+  // Only prune memory/*.md and MEMORY.md files that were intentionally removed.
   const dbFiles = getAllFiles(db);
   for (const dbFile of dbFiles) {
     if (!allPaths.has(dbFile.filePath)) {
-      deleteChunksByFile(db, dbFile.filePath);
-      db.prepare('DELETE FROM files WHERE file_path = ?').run(dbFile.filePath);
+      if (!dbFile.filePath.startsWith(CONV_PREFIX)) {
+        deleteChunksByFile(db, dbFile.filePath);
+        db.prepare('DELETE FROM files WHERE file_path = ?').run(dbFile.filePath);
+      }
     }
   }
 
