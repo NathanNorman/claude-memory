@@ -12,17 +12,27 @@ import {
   getMeta,
   setMeta,
 } from './db.js';
-import { chunkMarkdown, chunkExchanges } from './chunker.js';
+import { chunkMarkdown } from './chunker.js';
+import { chunkMarkdownSemantic } from './semantic-markdown-chunker.js';
+import { chunkExchangesSemantic } from './semantic-chunker.js';
 import { embedText } from './embeddings.js';
 import { hashText, EMBEDDING_MODEL } from './types.js';
 import type { MemoryChunk } from './types.js';
 import { parseConversationJsonl, parseConversationExchanges, MAX_FILE_BYTES } from './conversation-parser.js';
+import { scoreAllBoundaries, segmentVarianceDp } from './semantic-chunker.js';
+import { LlmBoundaryScorer } from './llm-boundary-scorer.js';
+import { evictStaleBoundaryScores } from './db.js';
 
 // --- Meta Keys ---
 
 const META_MODEL = 'embedding_model';
 const META_CHUNK_TOKENS = 'chunk_tokens';
-const CHUNK_TOKENS = '400-v2-exchange';
+const CHUNK_TOKENS_HEURISTIC = '400-v4-semantic-md';
+const CHUNK_TOKENS_LLM = '400-v4-semantic-llm';
+
+function getChunkTokens(llmScoring: boolean): string {
+  return llmScoring ? CHUNK_TOKENS_LLM : CHUNK_TOKENS_HEURISTIC;
+}
 
 /** Prefix for conversation file paths in the DB */
 const CONV_PREFIX = 'conversations/';
@@ -166,7 +176,7 @@ export function isIndexStale(db: DatabaseType, memoryDir: string, archiveDir?: s
   const storedModel = getMeta(db, META_MODEL);
   if (storedModel !== EMBEDDING_MODEL) return true;
   const storedTokens = getMeta(db, META_CHUNK_TOKENS);
-  if (storedTokens !== CHUNK_TOKENS) return true;
+  if (storedTokens !== CHUNK_TOKENS_HEURISTIC && storedTokens !== CHUNK_TOKENS_LLM) return true;
 
   // Quick mtime scan — compare file mtimes against last_indexed
   const dbFiles = getAllFiles(db);
@@ -306,8 +316,8 @@ export async function indexFile(
   // Delete old chunks for this file
   deleteChunksByFile(db, filePath);
 
-  // Chunk the content
-  const rawChunks = chunkMarkdown(content);
+  // Chunk the content using semantic markdown chunker
+  const rawChunks = chunkMarkdownSemantic(content);
   if (rawChunks.length === 0) {
     upsertFile(db, {
       filePath,
@@ -349,6 +359,59 @@ export async function indexFile(
   });
 }
 
+// --- Conversation Chunking with Pre-computed Scores ---
+
+import type { ConversationExchange, ExchangeChunk } from './types.js';
+
+/**
+ * Chunk exchanges using pre-computed boundary scores (from LLM scorer).
+ * Runs DP segmentation then builds ExchangeChunk objects.
+ */
+function chunkExchangesWithScores(
+  exchanges: ConversationExchange[],
+  scores: number[],
+): ExchangeChunk[] {
+  if (exchanges.length === 0) return [];
+
+  const segments = segmentVarianceDp(exchanges, scores, {
+    minChunkTokens: 150,
+    maxChunkTokens: 1600,
+    varianceWeight: 0.3,
+  });
+
+  const chunks: ExchangeChunk[] = [];
+  for (const [start, end] of segments) {
+    const segExchanges = exchanges.slice(start, end + 1);
+    const toolSet = new Set<string>();
+    for (const ex of segExchanges) {
+      for (const tc of ex.toolCalls) {
+        toolSet.add(tc.toolName);
+      }
+    }
+    const toolNames = Array.from(toolSet).sort();
+
+    const textParts = segExchanges.map((ex) => {
+      let text = `User: ${ex.userMessage}`;
+      if (ex.assistantMessage) text += `\n\nAssistant: ${ex.assistantMessage}`;
+      return text;
+    });
+    let text = textParts.join('\n\n---\n\n');
+    if (toolNames.length > 0) {
+      text += `\n\nTools: ${toolNames.join(', ')}`;
+    }
+
+    chunks.push({
+      exchanges: segExchanges,
+      startLine: segExchanges[0]!.lineStart,
+      endLine: segExchanges[segExchanges.length - 1]!.lineEnd,
+      text,
+      toolNames,
+      hash: hashText(text),
+    });
+  }
+  return chunks;
+}
+
 // --- Conversation File Indexing ---
 
 /**
@@ -373,6 +436,7 @@ function loadConversationSummary(absolutePath: string): string | null {
 async function indexConversationFile(
   db: DatabaseType,
   conv: ScannedConversationFile,
+  options?: { llmScoring?: boolean; llmScorer?: LlmBoundaryScorer },
 ): Promise<void> {
   // Quick mtime check — skip if file hasn't been modified since last index
   const existing = getFile(db, conv.filePath);
@@ -445,8 +509,20 @@ async function indexConversationFile(
   // Delete old chunks
   deleteChunksByFile(db, conv.filePath);
 
-  // Chunk exchanges (never splits mid-exchange)
-  const exchangeChunks = chunkExchanges(parsed.exchanges);
+  // Chunk exchanges using semantic boundary detection + DP segmentation
+  let exchangeChunks;
+  if (options?.llmScoring && options.llmScorer && parsed.exchanges.length > 1) {
+    // LLM scoring path: score boundaries with LLM, then DP segment
+    const llmScores = await options.llmScorer.scoreAll(parsed.exchanges);
+    if (llmScores !== null) {
+      exchangeChunks = chunkExchangesWithScores(parsed.exchanges, llmScores);
+    } else {
+      process.stderr.write(`[claude-memory] LLM scoring failed for ${conv.filePath}, falling back to heuristic\n`);
+      exchangeChunks = chunkExchangesSemantic(parsed.exchanges);
+    }
+  } else {
+    exchangeChunks = chunkExchangesSemantic(parsed.exchanges);
+  }
   if (exchangeChunks.length === 0) {
     upsertFile(db, {
       filePath: conv.filePath,
@@ -504,18 +580,21 @@ export async function indexAll(
   db: DatabaseType,
   memoryDir: string,
   archiveDir?: string,
+  options?: { llmScoring?: boolean; llmScorer?: LlmBoundaryScorer },
 ): Promise<{ files: number; chunks: number }> {
+  const chunkTokens = getChunkTokens(options?.llmScoring ?? false);
+
   // Check if model or chunking config changed — force full reindex
   const storedModel = getMeta(db, META_MODEL);
   const storedTokens = getMeta(db, META_CHUNK_TOKENS);
-  if (storedModel !== EMBEDDING_MODEL || storedTokens !== CHUNK_TOKENS) {
+  if (storedModel !== EMBEDDING_MODEL || storedTokens !== chunkTokens) {
     // Config changed: wipe all indexed data and reindex from scratch
     db.exec('DELETE FROM chunks_fts');
     db.exec('DELETE FROM chunks_vec');
     db.exec('DELETE FROM chunks');
     db.exec('DELETE FROM files');
     setMeta(db, META_MODEL, EMBEDDING_MODEL);
-    setMeta(db, META_CHUNK_TOKENS, CHUNK_TOKENS);
+    setMeta(db, META_CHUNK_TOKENS, chunkTokens);
   }
 
   // --- Memory files ---
@@ -535,7 +614,10 @@ export async function indexAll(
 
     let indexed = 0;
     for (const conv of convFiles) {
-      await indexConversationFile(db, conv);
+      await indexConversationFile(db, conv, {
+        llmScoring: options?.llmScoring,
+        llmScorer: options?.llmScorer,
+      });
       indexed++;
       if (indexed % 100 === 0) {
         process.stderr.write(`[claude-memory] Indexed ${indexed}/${convFiles.length} conversations\n`);
@@ -559,6 +641,9 @@ export async function indexAll(
       }
     }
   }
+
+  // Evict stale boundary score cache entries
+  evictStaleBoundaryScores(db);
 
   // Return stats
   const filesCount = (db.prepare('SELECT COUNT(*) AS cnt FROM files').get() as { cnt: number }).cnt;

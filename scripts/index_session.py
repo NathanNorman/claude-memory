@@ -11,15 +11,23 @@ Usage:
 """
 
 import hashlib
+import os
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
-# Add scripts/ to path for conversation_parser
+# Add scripts/ to path for conversation_parser and summary modules
 sys.path.insert(0, str(Path(__file__).parent))
 
 from conversation_parser import parse_conversation_jsonl
+
+# Summary configuration (env vars)
+SUMMARY_ENABLED = os.environ.get('MEMORY_SUMMARY_ENABLED', '0') == '1'
+SUMMARY_THRESHOLD = float(os.environ.get('MEMORY_SUMMARY_THRESHOLD', '8'))
+SUMMARY_MAX_ITER = int(os.environ.get('MEMORY_SUMMARY_MAX_ITER', '2'))
+SUMMARY_MODEL = os.environ.get('MEMORY_SUMMARY_MODEL', 'haiku')
 
 DB_PATH = Path.home() / '.claude-memory' / 'index' / 'memory.db'
 MAX_CHUNK_CHARS = 1600
@@ -42,6 +50,20 @@ def is_noise(user_msg: str, assistant_msg: str) -> bool:
             if pattern in user_msg:
                 return True
     return False
+
+
+def prepare_transcript(filtered_exchanges) -> str:
+    """Format exchanges as [User]/[Assistant] pairs, truncated to 30K chars."""
+    parts = []
+    for ex in filtered_exchanges:
+        text = f'[User]: {ex.user_message}'
+        if ex.assistant_message:
+            text += f'\n[Assistant]: {ex.assistant_message}'
+        parts.append(text)
+    transcript = '\n\n'.join(parts)
+    if len(transcript) > 30000:
+        transcript = transcript[:30000] + '\n...(truncated)'
+    return transcript
 
 
 def derive_index_path(session_file: Path) -> tuple[str, str]:
@@ -185,6 +207,42 @@ def main():
         f'({noise_count} noise filtered)',
         file=sys.stderr,
     )
+
+    # --- Iterative summary refinement (optional) ---
+    if SUMMARY_ENABLED and len(filtered) >= 3:
+        try:
+            from summary_refinement import summarize_with_refinement
+
+            transcript = prepare_transcript(filtered)
+            res = summarize_with_refinement(
+                transcript,
+                model=SUMMARY_MODEL,
+                threshold=SUMMARY_THRESHOLD,
+                max_iter=SUMMARY_MAX_ITER,
+            )
+            summary_text = (
+                f'[quality: score={res["score"]:.1f} iter={res["iterations"]} '
+                f'refined={str(res["refined"]).lower()}]\n{res["summary"]}'
+            )
+            conn2 = sqlite3.connect(str(DB_PATH), timeout=10.0)
+            conn2.execute('PRAGMA busy_timeout = 5000')
+            conn2.execute(
+                'UPDATE files SET summary = ? WHERE file_path = ?',
+                (summary_text, index_path),
+            )
+            conn2.commit()
+            conn2.close()
+            print(
+                f'[index-session] summary: score={res["score"]:.1f} '
+                f'iter={res["iterations"]} refined={str(res["refined"]).lower()} '
+                f'time={res["elapsed_seconds"]:.1f}s',
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(
+                f'[index-session] summary: failed — {e}',
+                file=sys.stderr,
+            )
 
 
 if __name__ == '__main__':

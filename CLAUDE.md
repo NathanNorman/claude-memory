@@ -93,6 +93,26 @@ sqlite-vec requires `BigInt` for rowid values in vec0 operations.
 
 Conversation chunks are **never pruned** from the index, even after Claude Code deletes the original `.jsonl` files. The index is the only surviving copy of that knowledge. Only curated memory files (`MEMORY.md`, `memory/*.md`) are pruned when removed from disk. This is enforced in `indexer.ts:indexAll()` — the prune loop skips any path starting with `conversations/`.
 
+### Codebase indexing
+
+Source code from external repos can be indexed for semantic search via `codebase_search` MCP tool and `memory_search` with `source=codebase`.
+
+```bash
+# Index a codebase (first time — full index)
+~/.claude-memory/graphiti-venv/bin/python3 ~/claude-memory/scripts/codebase-index.py --path ~/toast-analytics --name toast-analytics
+
+# Incremental update (only changed files)
+~/.claude-memory/graphiti-venv/bin/python3 ~/claude-memory/scripts/codebase-index.py --path ~/toast-analytics --name toast-analytics --update
+
+# List indexed codebases
+~/.claude-memory/graphiti-venv/bin/python3 ~/claude-memory/scripts/codebase-index.py --list
+
+# Remove a codebase
+~/.claude-memory/graphiti-venv/bin/python3 ~/claude-memory/scripts/codebase-index.py --remove --name toast-analytics
+```
+
+Codebase chunks are stored in the existing `chunks` table with `file_path` prefixed by `codebase:<name>/`. The `codebase_meta` table tracks per-file content hashes for incremental updates. A `PreToolUse:Write` hook (`~/.claude/hooks/checks/pre-write-codebase-check.py`) surfaces similar existing code when creating new source files.
+
 ### Python scripts (`scripts/`)
 
 Standalone Python utilities, not part of the MCP server or Node.js indexer:

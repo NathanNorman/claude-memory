@@ -1,0 +1,25 @@
+You are evaluating semantic boundaries between conversation exchanges in a software engineering coding session. Each exchange is a user-assistant turn in a Claude Code session.
+
+For each boundary between adjacent exchanges, assign a score from 0 to 3:
+
+0 = NO BOUNDARY — The exchanges are part of the same task, continuing the same work with no shift in intent or context.
+1 = WEAK BOUNDARY — Minor shift: the user asks a follow-up question, requests a small modification, or the assistant continues with a closely related subtask.
+2 = MODERATE BOUNDARY — Clear transition: the user moves to a different aspect of the project, switches files/modules, changes from reading to writing, or shifts from debugging to implementing.
+3 = STRONG BOUNDARY — Major topic shift: the user starts an entirely new task, switches projects, or there is a clear completion of one goal before starting another.
+
+SIGNALS TO EVALUATE:
+- Does the user's intent change between exchanges? (new task vs continuation)
+- Does the file/module context change significantly?
+- Is there a logical completion point? (solution delivered, error resolved, PR created)
+- Does the tool usage pattern shift? (reading/exploring → writing/editing, or vice versa)
+- Does the conversation topic shift to a different system, service, or domain?
+
+CRITICAL RULES:
+- Score ONLY based on the semantic relationship between adjacent exchanges.
+- Do NOT score based on exchange length or complexity.
+- A long exchange followed by a short one is NOT automatically a boundary.
+- Tool changes alone are weak signals — evaluate the INTENT behind tool usage.
+- When in doubt between two scores, choose the lower one.
+
+Return a JSON object with a "scores" array containing exactly {count} numbers (one per boundary).
+Format: {"scores": [s1, s2, s3, ...]}

@@ -6,6 +6,7 @@ Other files: File-level chunking with size-based splitting.
 """
 
 import ast
+import re
 from pathlib import Path
 
 
@@ -66,14 +67,220 @@ def chunk_python_file(path: str) -> list[dict]:
     return chunks
 
 
+def chunk_java_file(path: str) -> list[dict]:
+    """Extract classes, interfaces, and methods from a Java file.
+
+    Uses regex to split on top-level declarations. Each class/interface
+    becomes one chunk; standalone methods become separate chunks.
+    """
+    source = Path(path).read_text(errors='replace')
+    lines = source.split('\n')
+    if len(lines) <= 10:
+        return _chunk_file_level(path, source)
+
+    # Pattern matches class/interface/enum declarations and method signatures
+    decl_re = re.compile(
+        r'^(\s*)((?:public|protected|private|static|abstract|final|synchronized)\s+)*'
+        r'(?:class|interface|enum)\s+(\w+)',
+    )
+    method_re = re.compile(
+        r'^(\s{0,4})((?:public|protected|private|static|abstract|final|synchronized|default)\s+)+'
+        r'(?:<[^>]+>\s+)?(\w[\w<>\[\], ]*)\s+(\w+)\s*\(',
+    )
+
+    boundaries = []  # (line_idx, title, indent_level)
+    for i, line in enumerate(lines):
+        m = decl_re.match(line)
+        if m:
+            indent = len(m.group(1))
+            name = m.group(3)
+            kind = 'class' if 'class' in line else 'interface' if 'interface' in line else 'enum'
+            boundaries.append((i, f'{kind} {name}', indent))
+            continue
+        m = method_re.match(line)
+        if m:
+            indent = len(m.group(1))
+            name = m.group(4)
+            boundaries.append((i, f'{name}()', indent))
+
+    if not boundaries:
+        return _chunk_file_level(path, source)
+
+    return _boundaries_to_chunks(lines, boundaries, path)
+
+
+def chunk_kotlin_file(path: str) -> list[dict]:
+    """Extract classes, objects, and functions from a Kotlin file.
+
+    Uses regex to split on top-level declarations.
+    """
+    source = Path(path).read_text(errors='replace')
+    lines = source.split('\n')
+    if len(lines) <= 10:
+        return _chunk_file_level(path, source)
+
+    decl_re = re.compile(
+        r'^(\s*)((?:public|private|internal|protected|open|abstract|sealed|data|inline|value|'
+        r'override|suspend|actual|expect)\s+)*'
+        r'(?:class|interface|object|enum\s+class)\s+(\w+)',
+    )
+    fun_re = re.compile(
+        r'^(\s*)((?:public|private|internal|protected|open|override|suspend|inline|actual|expect)\s+)*'
+        r'fun\s+(?:<[^>]+>\s+)?(\w+)\s*[\(<]',
+    )
+
+    boundaries = []
+    for i, line in enumerate(lines):
+        m = decl_re.match(line)
+        if m:
+            indent = len(m.group(1))
+            name = m.group(3)
+            kind = 'class'
+            for kw in ('interface', 'object', 'enum'):
+                if kw in line:
+                    kind = kw
+                    break
+            boundaries.append((i, f'{kind} {name}', indent))
+            continue
+        m = fun_re.match(line)
+        if m:
+            indent = len(m.group(1))
+            name = m.group(3)
+            boundaries.append((i, f'fun {name}', indent))
+
+    if not boundaries:
+        return _chunk_file_level(path, source)
+
+    return _boundaries_to_chunks(lines, boundaries, path)
+
+
+def chunk_shell_file(path: str) -> list[dict]:
+    """Extract functions from a shell script.
+
+    Splits on function declarations (both `function name` and `name()` styles).
+    """
+    source = Path(path).read_text(errors='replace')
+    lines = source.split('\n')
+    if len(lines) <= 10:
+        return _chunk_file_level(path, source)
+
+    fun_re = re.compile(
+        r'^(\s*)(?:function\s+(\w+)|(\w+)\s*\(\s*\))\s*\{?\s*$'
+    )
+
+    boundaries = []
+    for i, line in enumerate(lines):
+        m = fun_re.match(line)
+        if m:
+            indent = len(m.group(1))
+            name = m.group(2) or m.group(3)
+            boundaries.append((i, f'function {name}', indent))
+
+    if not boundaries:
+        return _chunk_file_level(path, source)
+
+    return _boundaries_to_chunks(lines, boundaries, path)
+
+
+def _boundaries_to_chunks(
+    lines: list[str],
+    boundaries: list[tuple[int, str, int]],
+    path: str,
+) -> list[dict]:
+    """Convert declaration boundaries into chunks.
+
+    Classes/interfaces (indent 0-1) become single chunks that include all
+    their methods. Top-level functions become separate chunks.
+    """
+    chunks = []
+    total = len(lines)
+    used = set()  # track line ranges consumed by class-level chunks
+
+    # First pass: class-level declarations get everything until next same-indent boundary
+    for idx, (start, title, indent) in enumerate(boundaries):
+        is_type_decl = any(title.startswith(k) for k in ('class ', 'interface ', 'enum ', 'object '))
+        if not is_type_decl:
+            continue
+
+        # Extend to next boundary at same or lower indent level
+        end = total
+        for next_start, _, next_indent in boundaries[idx + 1:]:
+            if next_indent <= indent:
+                end = next_start
+                break
+
+        content = '\n'.join(lines[start:end]).rstrip()
+        if len(content.strip()) < 20:
+            continue
+
+        chunks.append({
+            'title': title,
+            'content': content,
+            'start_line': start + 1,
+            'end_line': end,
+        })
+        for ln in range(start, end):
+            used.add(ln)
+
+    # Second pass: standalone functions not inside a class
+    for idx, (start, title, indent) in enumerate(boundaries):
+        if start in used:
+            continue
+        is_type_decl = any(title.startswith(k) for k in ('class ', 'interface ', 'enum ', 'object '))
+        if is_type_decl:
+            continue
+
+        end = total
+        for next_start, _, next_indent in boundaries[idx + 1:]:
+            if next_indent <= indent:
+                end = next_start
+                break
+        else:
+            if idx + 1 < len(boundaries):
+                end = boundaries[idx + 1][0]
+
+        content = '\n'.join(lines[start:end]).rstrip()
+        if len(content.strip()) < 20:
+            continue
+
+        chunks.append({
+            'title': title,
+            'content': content,
+            'start_line': start + 1,
+            'end_line': end,
+        })
+
+    chunks.sort(key=lambda c: c['start_line'])
+
+    if not chunks:
+        return _chunk_file_level(path, '\n'.join(lines))
+
+    return chunks
+
+
+# Extension mapping for dispatch
+_EXT_CHUNKERS = {
+    '.java': chunk_java_file,
+    '.kt': chunk_kotlin_file,
+    '.sh': chunk_shell_file,
+}
+
+
 def chunk_file(path: str) -> list[dict]:
     """Chunk a file for embedding. Dispatches by extension.
 
     .py files: AST-aware chunking
+    .java/.kt: Regex-based class/method chunking
+    .sh: Regex-based function chunking
     Everything else: file-level chunking with size-based splitting
     """
     if path.endswith('.py'):
         return chunk_python_file(path)
+
+    for ext, chunker in _EXT_CHUNKERS.items():
+        if path.endswith(ext):
+            return chunker(path)
+
     return _chunk_file_level(path)
 
 

@@ -55,8 +55,8 @@ export interface SearchResult {
 
 // --- Constants ---
 
-export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
-export const EMBEDDING_DIMS = 384;
+export const EMBEDDING_MODEL = 'Xenova/bge-base-en-v1.5';
+export const EMBEDDING_DIMS = 768;
 export const EMBEDDING_PROVIDER = 'xenova-transformers';
 
 // --- Utility Functions ---

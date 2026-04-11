@@ -8,7 +8,7 @@ const MAX_INPUT_CHARS = 2000;
 
 async function getEmbedder(): Promise<FeatureExtractionPipeline> {
   if (!embedder) {
-    embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2') as FeatureExtractionPipeline;
+    embedder = await pipeline('feature-extraction', 'Xenova/bge-base-en-v1.5') as FeatureExtractionPipeline;
   }
   return embedder;
 }

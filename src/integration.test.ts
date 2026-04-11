@@ -9,6 +9,7 @@ import { openDb } from './db.js';
 import { indexAll, indexFile, scanFiles } from './indexer.js';
 import { search } from './search.js';
 import { embedText } from './embeddings.js';
+import { EMBEDDING_DIMS } from './types.js';
 import type { Database as DatabaseType } from 'better-sqlite3';
 
 // --- Helpers ---
@@ -272,7 +273,7 @@ describe('Integration: search returns ranked results', () => {
       assert.ok(r.chunk.content.length > 0, 'Chunk content should not be empty');
       assert.ok(r.chunk.filePath.length > 0, 'Chunk filePath should not be empty');
       assert.ok(r.chunk.id.length > 0, 'Chunk id should not be empty');
-      assert.ok(r.chunk.embedding.length === 384, 'Embedding should be 384 dimensions');
+      assert.ok(r.chunk.embedding.length === EMBEDDING_DIMS, `Embedding should be ${EMBEDDING_DIMS} dimensions`);
     }
   });
 });
@@ -430,7 +431,7 @@ describe('Integration: embeddings produce valid vectors', () => {
   it('embedText returns 384-dim Float32Array', async () => {
     const embedding = await embedText('test embedding generation');
     assert.ok(embedding instanceof Float32Array, 'Should return Float32Array');
-    assert.equal(embedding.length, 384, 'Should be 384 dimensions');
+    assert.equal(embedding.length, EMBEDDING_DIMS, `Should be ${EMBEDDING_DIMS} dimensions`);
   });
 
   it('embeddings are normalized (unit length)', async () => {
@@ -451,7 +452,7 @@ describe('Integration: embeddings produce valid vectors', () => {
     // Cosine similarity (embeddings are normalized, so dot product = cosine)
     let simSimilar = 0;
     let simDifferent = 0;
-    for (let i = 0; i < 384; i++) {
+    for (let i = 0; i < emb1.length; i++) {
       simSimilar += emb1[i]! * emb2[i]!;
       simDifferent += emb1[i]! * emb3[i]!;
     }
@@ -460,5 +461,136 @@ describe('Integration: embeddings produce valid vectors', () => {
       simSimilar > simDifferent,
       `Similar texts should have higher cosine similarity: ${simSimilar} > ${simDifferent}`,
     );
+  });
+});
+
+// --- LLM Boundary Scorer Tests ---
+
+import { LlmBoundaryScorer } from './llm-boundary-scorer.js';
+import type { ConversationExchange } from './types.js';
+
+function makeMockExchanges(count: number): ConversationExchange[] {
+  return Array.from({ length: count }, (_, i) => ({
+    userMessage: `User message ${i}: What should we do about the ${i % 2 === 0 ? 'database' : 'frontend'} issue?`,
+    assistantMessage: `Assistant response ${i}: I'll look into the ${i % 2 === 0 ? 'database' : 'frontend'} changes.`,
+    lineStart: i * 10 + 1,
+    lineEnd: i * 10 + 10,
+    toolCalls: [],
+  }));
+}
+
+describe('Integration: LLM boundary scorer', () => {
+  let tmpDir: string;
+  let dbPath: string;
+  let db: DatabaseType;
+
+  before(() => {
+    tmpDir = makeTmpDir();
+    dbPath = join(tmpDir, 'index', 'memory.db');
+    db = openDb(dbPath);
+  });
+
+  after(() => {
+    if (db) db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('scorer returns correct-length array for mock exchanges', async () => {
+    // Mock scorer that doesn't actually call LLM — test the class structure
+    const exchanges = makeMockExchanges(10);
+    const scorer = new LlmBoundaryScorer({
+      llmConfig: { baseUrl: 'http://localhost:9999', model: 'test' },
+    });
+
+    // Override scoreWindow to return mock scores without hitting LLM
+    scorer.scoreWindow = async (exs: ConversationExchange[]) => {
+      return new Array(exs.length - 1).fill(1.5);
+    };
+
+    const scores = await scorer.scoreAll(exchanges);
+    assert.ok(scores !== null, 'Should return scores array');
+    assert.equal(scores!.length, 9, 'Should have 9 boundary scores for 10 exchanges');
+    for (const s of scores!) {
+      assert.ok(s >= 0 && s <= 3, `Score ${s} should be in 0-3 range`);
+    }
+  });
+
+  it('cache hit skips LLM call on second invocation', async () => {
+    const exchanges = makeMockExchanges(5);
+    let llmCallCount = 0;
+
+    const scorer = new LlmBoundaryScorer({
+      llmConfig: { baseUrl: 'http://localhost:9999', model: 'test' },
+      singlePass: true,
+    }, db);
+
+    scorer.scoreWindow = async (exs: ConversationExchange[]) => {
+      llmCallCount++;
+      return new Array(exs.length - 1).fill(2.0);
+    };
+
+    // First call — should hit LLM
+    const scores1 = await scorer.scoreAll(exchanges);
+    assert.ok(scores1 !== null);
+    const firstCallCount = llmCallCount;
+    assert.ok(firstCallCount > 0, 'Should have made LLM calls');
+
+    // Second call with fresh scorer using same DB — should use cache
+    const scorer2 = new LlmBoundaryScorer({
+      llmConfig: { baseUrl: 'http://localhost:9999', model: 'test' },
+      singlePass: true,
+    }, db);
+
+    let secondLlmCalls = 0;
+    scorer2.scoreWindow = async (exs: ConversationExchange[]) => {
+      secondLlmCalls++;
+      return new Array(exs.length - 1).fill(2.0);
+    };
+
+    const scores2 = await scorer2.scoreAll(exchanges);
+    assert.ok(scores2 !== null);
+    assert.equal(secondLlmCalls, 0, 'Should not call LLM on cache hit');
+    assert.equal(scorer2.cacheHits, scores2!.length, 'All scores should be cache hits');
+  });
+
+  it('scorer returns null on total LLM failure', async () => {
+    const exchanges = makeMockExchanges(5);
+    const scorer = new LlmBoundaryScorer({
+      llmConfig: { baseUrl: 'http://localhost:9999', model: 'test' },
+      singlePass: true,
+    });
+
+    // Override scoreWithWindow directly to simulate total failure
+    scorer.scoreWithWindow = async () => null;
+
+    const scores = await scorer.scoreAll(exchanges);
+    assert.equal(scores, null, 'Should return null on total failure');
+  });
+
+  it('CHUNK_TOKENS mismatch triggers full reindex on mode switch', async () => {
+    const testDir = makeTmpDir();
+    const testDbPath = join(testDir, 'index', 'memory.db');
+    const testDb = openDb(testDbPath);
+
+    writeMd(testDir, 'MEMORY.md', SAMPLE_MEMORY_MD);
+
+    // Index with heuristic mode
+    await indexAll(testDb, testDir);
+    const chunks1 = (testDb.prepare('SELECT COUNT(*) AS cnt FROM chunks').get() as { cnt: number }).cnt;
+    assert.ok(chunks1 > 0, 'Should have chunks after first index');
+
+    // Index again with same mode — should be idempotent
+    await indexAll(testDb, testDir);
+    const chunks2 = (testDb.prepare('SELECT COUNT(*) AS cnt FROM chunks').get() as { cnt: number }).cnt;
+    assert.equal(chunks2, chunks1, 'Should be idempotent');
+
+    // Index with llmScoring flag — should trigger reindex due to CHUNK_TOKENS change
+    // (won't actually call LLM since no conversation files, just markdown)
+    await indexAll(testDb, testDir, undefined, { llmScoring: true });
+    const storedTokens = testDb.prepare("SELECT value FROM meta WHERE key = 'chunk_tokens'").get() as { value: string };
+    assert.equal(storedTokens.value, '400-v4-semantic-llm', 'Should store LLM chunk tokens');
+
+    testDb.close();
+    rmSync(testDir, { recursive: true, force: true });
   });
 });

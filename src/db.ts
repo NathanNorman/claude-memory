@@ -61,7 +61,7 @@ export function openDb(dbPath: string): DatabaseType {
   // Vec0 virtual table for vector similarity search
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-      embedding float[384]
+      embedding float[768]
     )
   `);
 
@@ -86,6 +86,17 @@ export function openDb(dbPath: string): DatabaseType {
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_embedding_cache_updated_at ON embedding_cache(updated_at)`);
+
+  // Boundary score cache: memoize expensive semantic boundary scores
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS boundary_score_cache (
+      pair_hash TEXT NOT NULL,
+      scorer_version TEXT NOT NULL,
+      score REAL NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (pair_hash, scorer_version)
+    )
+  `);
 
   // Migrate: add summary column to files table (idempotent)
   try { db.exec(`ALTER TABLE files ADD COLUMN summary TEXT`); } catch { /* already exists */ }
@@ -249,6 +260,38 @@ export function setCachedEmbedding(db: DatabaseType, hash: string, embedding: Fl
     embedding.length,
     Date.now(),
   );
+}
+
+// --- Boundary Score Cache ---
+
+export function getCachedBoundaryScore(
+  db: DatabaseType,
+  pairHash: string,
+  scorerVersion: string,
+): number | null {
+  const row = db.prepare(
+    `SELECT score FROM boundary_score_cache WHERE pair_hash = ? AND scorer_version = ?`,
+  ).get(pairHash, scorerVersion) as { score: number } | undefined;
+  return row?.score ?? null;
+}
+
+export function setCachedBoundaryScore(
+  db: DatabaseType,
+  pairHash: string,
+  scorerVersion: string,
+  score: number,
+): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO boundary_score_cache (pair_hash, scorer_version, score, created_at) VALUES (?, ?, ?, ?)`,
+  ).run(pairHash, scorerVersion, score, Date.now());
+}
+
+export function evictStaleBoundaryScores(db: DatabaseType): void {
+  // Delete cache entries whose pair_hash is not found in any current chunk content
+  // Since we can't easily reverse-match pair hashes to exchange content,
+  // delete entries older than 30 days as a simple staleness heuristic
+  const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  db.prepare(`DELETE FROM boundary_score_cache WHERE created_at < ?`).run(thirtyDaysAgo);
 }
 
 // --- Meta ---

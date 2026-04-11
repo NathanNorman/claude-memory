@@ -73,7 +73,58 @@ class FlatSearchBackend:
             self._conn.execute('PRAGMA busy_timeout = 5000')
             self._conn.execute('PRAGMA journal_mode = WAL')
             self._conn.row_factory = sqlite3.Row
+            self._ensure_codebase_meta_table()
         return self._conn
+
+    def _ensure_codebase_meta_table(self) -> None:
+        """Create codebase_meta table for tracking indexed codebase files."""
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS codebase_meta (
+                codebase TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                indexed_at TEXT NOT NULL,
+                PRIMARY KEY (codebase, file_path)
+            )
+        ''')
+        self._conn.commit()
+
+    def upsert_codebase_meta(self, codebase: str, file_path: str, content_hash: str) -> None:
+        """Upsert a row into codebase_meta for the given codebase and file."""
+        conn = self._ensure_conn()
+        conn.execute(
+            '''INSERT INTO codebase_meta (codebase, file_path, content_hash, indexed_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT (codebase, file_path) DO UPDATE SET
+                   content_hash = excluded.content_hash,
+                   indexed_at = excluded.indexed_at''',
+            (codebase, file_path, content_hash, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+    def get_codebase_meta(self, codebase: str) -> list[dict]:
+        """Return all codebase_meta rows for a codebase as dicts."""
+        conn = self._ensure_conn()
+        rows = conn.execute(
+            'SELECT file_path, content_hash, indexed_at FROM codebase_meta WHERE codebase = ?',
+            (codebase,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_codebase_chunks(self, codebase: str) -> None:
+        """Delete all chunks, codebase_meta rows, and FTS entries for a codebase."""
+        conn = self._ensure_conn()
+        prefix = f'codebase:{codebase}/%'
+        # Delete from FTS index (content-synced, needs explicit delete)
+        conn.execute(
+            "DELETE FROM chunks_fts WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path LIKE ?)",
+            (prefix,),
+        )
+        # Delete main chunks
+        conn.execute('DELETE FROM chunks WHERE file_path LIKE ?', (prefix,))
+        # Delete tracking metadata
+        conn.execute('DELETE FROM codebase_meta WHERE codebase = ?', (codebase,))
+        conn.commit()
 
     # --- Search primitives (ported from hybrid.ts / search.ts) ---
 
@@ -1084,9 +1135,12 @@ async def memory_search(
 
         fp = r['file_path']
         is_conv = fp.startswith(CONV_PREFIX)
+        is_codebase = fp.startswith('codebase:')
 
         # Source filter
-        if source == 'curated' and is_conv:
+        if source == 'codebase' and not is_codebase:
+            continue
+        if source == 'curated' and (is_conv or is_codebase):
             continue
         if source == 'conversations' and not is_conv:
             continue
@@ -1135,6 +1189,10 @@ async def memory_search(
             entry['startLine'] = r.get('start_line')
             entry['endLine'] = r.get('end_line')
 
+        if is_codebase:
+            entry['title'] = r.get('title', '')
+            entry['source'] = 'codebase'
+
         if is_conv:
             if entry_project:
                 entry['project'] = normalize_project(entry_project)
@@ -1152,6 +1210,62 @@ async def memory_search(
         filtered.append(entry)
 
     return {'results': filtered}
+
+
+@mcp_app.tool()
+async def codebase_search(
+    query: str,
+    codebase: str = '',
+    maxResults: int = 10,
+) -> dict:
+    """Search indexed codebases for relevant source code.
+
+    Runs hybrid search (FTS5 keyword + vector similarity + RRF merge)
+    filtered to indexed codebase chunks. Use this to find existing
+    implementations before writing new code.
+
+    Args:
+        query: Search query (e.g., "manifest discovery", "sync schema from S3")
+        codebase: Filter to a specific codebase name (e.g., "toast-analytics"). Empty = all codebases.
+        maxResults: Maximum results to return (default 10)
+    """
+    if not flat_backend:
+        return {'error': 'Flat search backend not available', 'results': []}
+
+    prefix = f'codebase:{codebase}/' if codebase else 'codebase:'
+    fetch_limit = maxResults * 3
+
+    # Keyword search
+    flat_hits = flat_backend.search_keyword(query, fetch_limit * 2)
+    flat_hits = [h for h in flat_hits if h['file_path'].startswith(prefix)]
+
+    # Vector search
+    vector_hits: list[dict] = []
+    if vector_backend:
+        try:
+            all_vec = vector_backend.search(query, fetch_limit * 2)
+            vector_hits = [h for h in all_vec if h['file_path'].startswith(prefix)]
+        except Exception as e:
+            log.warning(f'Vector search failed in codebase_search: {e}')
+
+    # Merge via RRF
+    if vector_hits:
+        merged = FlatSearchBackend.merge_rrf(flat_hits, vector_hits)
+    else:
+        merged = flat_hits
+
+    results = []
+    for r in merged[:maxResults]:
+        results.append({
+            'path': r['file_path'],
+            'title': r.get('title', ''),
+            'snippet': smart_truncate(r.get('content', ''), 300),
+            'score': round(r.get('score', 0), 3),
+            'startLine': r.get('start_line'),
+            'endLine': r.get('end_line'),
+        })
+
+    return {'results': results}
 
 
 @mcp_app.tool()

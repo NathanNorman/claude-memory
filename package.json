@@ -20,6 +20,7 @@
     "build:doctor": "esbuild src/doctor-cli.ts --bundle --platform=node --format=esm --outfile=dist/doctor-cli.js --external:better-sqlite3 --external:sqlite-vec --external:@xenova/transformers --external:fsevents",
     "typecheck": "tsc --noEmit",
     "start": "node dist/server.js",
-    "test": "tsc && node --test dist/integration.test.js"
+    "test": "tsc && cp -r src/prompts dist/prompts 2>/dev/null; node --test dist/integration.test.js",
+    "postbuild": "mkdir -p dist/prompts && cp src/prompts/*.txt dist/prompts/ 2>/dev/null || true"
   }
 }

@@ -1,0 +1,6 @@
+Score the {count} boundaries between these conversation exchanges.
+
+{text}
+
+Return exactly {count} scores as JSON: {{"scores": [s1, s2, ...]}}
+Each score must be 0, 1, 2, or 3.
