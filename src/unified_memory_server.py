@@ -228,6 +228,79 @@ class FlatSearchBackend:
                 })
         return results
 
+    _STOPWORDS = frozenset({
+        'a', 'an', 'the', 'is', 'was', 'are', 'were', 'be', 'been', 'being',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'shall', 'can', 'to', 'of', 'in', 'for',
+        'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during',
+        'before', 'after', 'above', 'below', 'between', 'and', 'but', 'or',
+        'not', 'no', 'nor', 'so', 'if', 'then', 'than', 'too', 'very',
+        'what', 'when', 'where', 'who', 'whom', 'which', 'how', 'why',
+        'that', 'this', 'these', 'those', 'it', 'its', 'he', 'she', 'they',
+        'we', 'you', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his',
+        'their', 'our', 'about', 'up', 'out', 'just', 'also', 'some', 'any',
+        'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other', 'own',
+    })
+
+    def search_keyword_and(self, query: str, limit: int) -> list[dict]:
+        """FTS5 keyword search with AND logic — chunks must match ALL significant tokens.
+        Returns fewer but more precise results than OR search."""
+        tokens = re.findall(r'[A-Za-z0-9_]+', query)
+        sig_tokens = [t for t in tokens if t.lower() not in self._STOPWORDS and len(t) > 1]
+        if len(sig_tokens) < 2:
+            return []
+
+        fts_query = ' AND '.join(f'"{t}"' for t in sig_tokens)
+        conn = self._ensure_conn()
+        try:
+            rows = conn.execute(
+                'SELECT rowid, rank FROM chunks_fts '
+                'WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?',
+                (fts_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            log.debug(f'FTS5 AND search failed: {e}')
+            return []
+
+        results = []
+        for row in rows:
+            chunk = conn.execute(
+                'SELECT id, file_path, chunk_index, start_line, end_line, '
+                'title, content FROM chunks WHERE rowid = ?',
+                (row['rowid'],),
+            ).fetchone()
+            if chunk:
+                results.append({
+                    'id': chunk['id'],
+                    'file_path': chunk['file_path'],
+                    'chunk_index': chunk['chunk_index'],
+                    'start_line': chunk['start_line'],
+                    'end_line': chunk['end_line'],
+                    'title': chunk['title'],
+                    'content': chunk['content'],
+                    'score': self.bm25_rank_to_score(row['rank']),
+                })
+        return results
+
+    @staticmethod
+    def merge_rrf_multi(ranked_lists: list[tuple[str, list[dict]]], k: int = 60) -> list[dict]:
+        """N-way Reciprocal Rank Fusion. Extends merge_rrf to any number of result lists."""
+        by_id: dict[str, dict] = {}
+        for name, results in ranked_lists:
+            for rank, r in enumerate(results):
+                rid = r['id']
+                if rid not in by_id:
+                    by_id[rid] = {'result': r, 'rrf_score': 0.0}
+                by_id[rid]['rrf_score'] += 1.0 / (k + rank + 1)
+
+        merged = []
+        for v in by_id.values():
+            entry = dict(v['result'])
+            entry['score'] = v['rrf_score']
+            merged.append(entry)
+        merged.sort(key=lambda x: x['score'], reverse=True)
+        return merged
+
     # --- File / UUID helpers ---
 
     def get_file_summary(self, file_path: str) -> Optional[str]:
@@ -1104,8 +1177,11 @@ async def memory_search(
     has_filters = bool(after or before or project or source)
     fetch_limit = maxResults * (5 if has_filters else 3)
 
-    # Flat keyword search — synchronous but fast (<50ms typically)
+    # Flat keyword search (OR) — synchronous but fast (<50ms typically)
     flat_original = flat_backend.search_keyword(query, fetch_limit * 2)
+
+    # Flat keyword search (AND) — more precise, fewer results
+    flat_and = flat_backend.search_keyword_and(query, fetch_limit * 2)
 
     # Vector similarity search — synchronous, first call loads model (~2s), then fast
     vector_hits: list[dict] = []
@@ -1115,9 +1191,15 @@ async def memory_search(
         except Exception as e:
             log.warning(f'Vector search failed: {e}')
 
-    # Merge keyword + vector via RRF
+    # Merge via N-way RRF (keyword_OR + keyword_AND + vector)
+    ranked_lists = [('keyword', flat_original)]
+    if flat_and:
+        ranked_lists.append(('keyword_and', flat_and))
     if vector_hits:
-        merged = FlatSearchBackend.merge_rrf(flat_original, vector_hits)
+        ranked_lists.append(('vector', vector_hits))
+
+    if len(ranked_lists) > 1:
+        merged = FlatSearchBackend.merge_rrf_multi(ranked_lists)
     else:
         merged = flat_original
 
@@ -1235,9 +1317,11 @@ async def codebase_search(
     prefix = f'codebase:{codebase}/' if codebase else 'codebase:'
     fetch_limit = maxResults * 3
 
-    # Keyword search
+    # Keyword search (OR + AND)
     flat_hits = flat_backend.search_keyword(query, fetch_limit * 2)
     flat_hits = [h for h in flat_hits if h['file_path'].startswith(prefix)]
+    flat_and = flat_backend.search_keyword_and(query, fetch_limit * 2)
+    flat_and = [h for h in flat_and if h['file_path'].startswith(prefix)]
 
     # Vector search
     vector_hits: list[dict] = []
@@ -1248,9 +1332,15 @@ async def codebase_search(
         except Exception as e:
             log.warning(f'Vector search failed in codebase_search: {e}')
 
-    # Merge via RRF
+    # Merge via N-way RRF
+    ranked_lists = [('keyword', flat_hits)]
+    if flat_and:
+        ranked_lists.append(('keyword_and', flat_and))
     if vector_hits:
-        merged = FlatSearchBackend.merge_rrf(flat_hits, vector_hits)
+        ranked_lists.append(('vector', vector_hits))
+
+    if len(ranked_lists) > 1:
+        merged = FlatSearchBackend.merge_rrf_multi(ranked_lists)
     else:
         merged = flat_hits
 

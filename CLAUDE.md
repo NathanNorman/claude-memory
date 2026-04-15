@@ -43,8 +43,10 @@ Tests use Node.js native test runner (`node:test`). Single test file: `src/integ
 unified-mcp-launcher.sh
   → unified_memory_server.py (FastMCP, stdio transport)
     ├── FlatSearchBackend    — FTS5 keyword search (SQLite)
+    │   ├── search_keyword       — OR query (any token matches)
+    │   └── search_keyword_and   — AND query (all significant tokens must match)
     ├── VectorSearchBackend  — Brute-force cosine similarity (numpy over embedding BLOBs)
-    └── RRF merge            — Reciprocal Rank Fusion (k=60) combines both result sets
+    └── 3-way RRF merge      — Reciprocal Rank Fusion (k=60) combines keyword_OR + keyword_AND + vector
 ```
 
 Four MCP tools: `memory_search`, `memory_read`, `memory_write`, `get_status`.
@@ -122,7 +124,7 @@ Standalone Python utilities, not part of the MCP server or Node.js indexer:
 
 ## Key Design Decisions
 
-- **Hybrid search with RRF**: Vector (cosine similarity) and keyword (FTS5 BM25) results merged via Reciprocal Rank Fusion (k=60) rather than weighted-sum scoring. Avoids suppressing keyword-only results below thresholds.
+- **3-way hybrid search with RRF**: Three retrieval channels — FTS5 keyword (OR), FTS5 keyword (AND), and vector cosine similarity — merged via N-way Reciprocal Rank Fusion (k=60). The AND keyword channel adds a precision signal: chunks matching ALL significant query tokens rank higher. Validated via LoCoMo benchmark: +1.1pp R@5, +0.5pp R@10 over 2-way RRF. Entity overlap, temporal proximity, scene clustering, MMR reranking, and adjacency expansion were all tested and rejected (negative or zero impact).
 - **Two embedding paths**: Node.js indexer uses Xenova/transformers.js (ONNX). Python server uses sentence-transformers (PyTorch). Same model (`all-MiniLM-L6-v2`), same 384-dim output, compatible embeddings.
 - **Python reads BLOBs, not vec0**: The Python server loads all embedding BLOBs into a numpy matrix for brute-force cosine sim. The `chunks_vec` (vec0) table exists but is only written/queried by the Node.js side. This is a pragmatic workaround — `sqlite-vec` Python bindings don't load on this platform.
 - **Exchange-aware chunking**: Conversation archives are chunked at exchange boundaries — user/assistant pairs are never split across chunks.
