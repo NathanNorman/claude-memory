@@ -88,6 +88,50 @@ class FlatSearchBackend:
             )
         ''')
         self._conn.commit()
+        self._ensure_dep_tables()
+
+    def _ensure_dep_tables(self) -> None:
+        """Create edges and symbols tables for dependency graph."""
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codebase TEXT NOT NULL,
+                source_file TEXT NOT NULL,
+                target_file TEXT,
+                edge_type TEXT NOT NULL,
+                metadata TEXT,
+                updated_at INTEGER NOT NULL
+            )
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_edges_source
+            ON edges(source_file, codebase)
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_edges_target
+            ON edges(target_file, codebase)
+        ''')
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS symbols (
+                id TEXT PRIMARY KEY,
+                codebase TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_symbols_name
+            ON symbols(name, codebase)
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_symbols_file
+            ON symbols(file_path, codebase)
+        ''')
+        self._conn.commit()
 
     def upsert_codebase_meta(self, codebase: str, file_path: str, content_hash: str) -> None:
         """Upsert a row into codebase_meta for the given codebase and file."""
@@ -1266,6 +1310,127 @@ async def codebase_search(
         })
 
     return {'results': results}
+
+
+@mcp_app.tool()
+async def dependency_search(
+    file_path: str,
+    codebase: str = '',
+    direction: str = 'imported_by',
+    maxResults: int = 50,
+) -> dict:
+    """Search the dependency graph for files that import or are imported by a given file.
+
+    Use this to understand blast radius: which files depend on a changed file,
+    or what a file depends on.
+
+    Args:
+        file_path: Relative file path within the codebase (e.g., "src/main/java/.../Foo.java")
+        codebase: Codebase name (e.g., "toast-analytics"). Empty = search all.
+        direction: "imported_by" = find files that import this file (reverse deps),
+                   "imports" = find files this file imports (forward deps)
+        maxResults: Maximum results to return (default 50)
+    """
+    if not flat_backend:
+        return {'error': 'Flat search backend not available', 'results': []}
+
+    conn = flat_backend._ensure_conn()
+
+    if direction == 'imports':
+        query = 'SELECT target_file, edge_type, metadata FROM edges WHERE source_file = ?'
+        params: list = [file_path]
+    else:
+        query = 'SELECT source_file, edge_type, metadata FROM edges WHERE target_file = ?'
+        params = [file_path]
+
+    if codebase:
+        query += ' AND codebase = ?'
+        params.append(codebase)
+
+    query += f' LIMIT {int(maxResults)}'
+
+    try:
+        rows = conn.execute(query, params).fetchall()
+    except Exception as e:
+        return {'error': str(e), 'results': []}
+
+    results = []
+    for row in rows:
+        dep_file = row[0]
+        if dep_file is None:
+            continue
+        results.append({
+            'file': dep_file,
+            'edge_type': row[1],
+            'metadata': row[2],
+        })
+
+    return {
+        'file': file_path,
+        'direction': direction,
+        'count': len(results),
+        'results': results,
+    }
+
+
+@mcp_app.tool()
+async def symbol_search(
+    name: str,
+    codebase: str = '',
+    kind: str = '',
+    maxResults: int = 20,
+) -> dict:
+    """Search for symbol declarations (classes, interfaces, functions, methods) by name.
+
+    Use this to find where a class or function is defined, or to discover
+    all classes matching a pattern.
+
+    Args:
+        name: Symbol name or pattern to search for. Supports SQL LIKE patterns (% for wildcard).
+        codebase: Codebase name (e.g., "toast-analytics"). Empty = search all.
+        kind: Filter by kind: "class", "interface", "enum", "function", "method", "object". Empty = all.
+        maxResults: Maximum results to return (default 20)
+    """
+    if not flat_backend:
+        return {'error': 'Flat search backend not available', 'results': []}
+
+    conn = flat_backend._ensure_conn()
+
+    # Support both exact match and LIKE patterns
+    if '%' in name:
+        name_clause = 'name LIKE ?'
+    else:
+        name_clause = 'name = ?'
+
+    query = f'SELECT id, codebase, file_path, name, kind, start_line, end_line FROM symbols WHERE {name_clause}'
+    params: list = [name]
+
+    if codebase:
+        query += ' AND codebase = ?'
+        params.append(codebase)
+    if kind:
+        query += ' AND kind = ?'
+        params.append(kind)
+
+    query += f' LIMIT {int(maxResults)}'
+
+    try:
+        rows = conn.execute(query, params).fetchall()
+    except Exception as e:
+        return {'error': str(e), 'results': []}
+
+    results = []
+    for row in rows:
+        results.append({
+            'codebase': row['codebase'],
+            'file': row['file_path'],
+            'name': row['name'],
+            'kind': row['kind'],
+            'startLine': row['start_line'],
+            'endLine': row['end_line'],
+        })
+
+    return {'count': len(results), 'results': results}
 
 
 @mcp_app.tool()

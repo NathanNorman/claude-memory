@@ -387,6 +387,157 @@ def remove_codebase(conn: sqlite3.Connection, name: str) -> None:
     print(f'Removed {name}: {chunk_count} chunks, {meta_count} file records deleted.')
 
 
+def ensure_dep_tables(conn: sqlite3.Connection) -> None:
+    """Create edges and symbols tables if they don't exist."""
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codebase TEXT NOT NULL,
+            source_file TEXT NOT NULL,
+            target_file TEXT,
+            edge_type TEXT NOT NULL,
+            metadata TEXT,
+            updated_at INTEGER NOT NULL
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_file, codebase)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_file, codebase)')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS symbols (
+            id TEXT PRIMARY KEY,
+            codebase TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name, codebase)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path, codebase)')
+    conn.commit()
+
+
+# Extensions that support dependency extraction
+DEP_EXTENSIONS = {'.java', '.kt', '.py'}
+
+
+def index_dependencies(
+    conn: sqlite3.Connection,
+    name: str,
+    repo_path: Path,
+    incremental: bool = False,
+) -> dict:
+    """Extract imports and symbols from source files and store as edges/symbols."""
+    from ast_parser import extract_imports, extract_symbols
+    from import_resolver import resolve_import, clear_cache
+
+    clear_cache()
+    ensure_dep_tables(conn)
+
+    files = discover_files(repo_path)
+    dep_files = [f for f in files if f.suffix in DEP_EXTENSIONS]
+
+    if not dep_files:
+        return {'error': 'No parseable source files found'}
+
+    # Load existing hashes for incremental mode
+    existing_hashes: dict[str, str] = {}
+    if incremental:
+        rows = conn.execute(
+            'SELECT file_path, content_hash FROM codebase_meta WHERE codebase = ?',
+            (name,),
+        ).fetchall()
+        existing_hashes = {r['file_path']: r['content_hash'] for r in rows}
+
+    now_ts = int(time.time())
+    total_edges = 0
+    total_symbols = 0
+    total_files = 0
+    skipped = 0
+    t0 = time.time()
+    repo_str = str(repo_path)
+
+    for i, fpath in enumerate(dep_files):
+        rel = str(fpath.relative_to(repo_path))
+
+        # Compute hash and skip unchanged in incremental mode
+        try:
+            fhash = file_hash(fpath)
+        except Exception:
+            continue
+
+        if incremental and existing_hashes.get(rel) == fhash:
+            skipped += 1
+            continue
+
+        # Determine language from extension
+        lang = {'java': 'java', 'kt': 'kotlin', 'py': 'python'}.get(fpath.suffix.lstrip('.'))
+        if not lang:
+            continue
+
+        # Delete old edges/symbols for this file
+        conn.execute('DELETE FROM edges WHERE source_file = ? AND codebase = ?', (rel, name))
+        conn.execute('DELETE FROM symbols WHERE file_path = ? AND codebase = ?', (rel, name))
+
+        # Extract and store imports as edges
+        try:
+            imports = extract_imports(str(fpath))
+        except Exception as e:
+            print(f'[deps] Import parse failed {rel}: {e}', file=sys.stderr)
+            imports = []
+
+        for imp in imports:
+            target = resolve_import(imp['import_name'], repo_str, lang)
+            conn.execute(
+                'INSERT INTO edges (codebase, source_file, target_file, edge_type, metadata, updated_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (name, rel, target, imp['import_type'], imp['import_name'], now_ts),
+            )
+            total_edges += 1
+
+        # Extract and store symbols
+        try:
+            syms = extract_symbols(str(fpath))
+        except Exception as e:
+            print(f'[deps] Symbol parse failed {rel}: {e}', file=sys.stderr)
+            syms = []
+
+        for sym in syms:
+            sym_id = f'{name}:{rel}::{sym["name"]}'
+            conn.execute(
+                'INSERT OR REPLACE INTO symbols (id, codebase, file_path, name, kind, start_line, end_line, updated_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (sym_id, name, rel, sym['name'], sym['kind'], sym['start_line'], sym['end_line'], now_ts),
+            )
+            total_symbols += 1
+
+        total_files += 1
+
+        if total_files % 100 == 0:
+            conn.commit()
+            elapsed = time.time() - t0
+            print(
+                f'\r[deps] {total_files}/{len(dep_files)} files, '
+                f'{total_edges} edges, {total_symbols} symbols, {elapsed:.1f}s',
+                end='', file=sys.stderr,
+            )
+
+    conn.commit()
+    elapsed = time.time() - t0
+    print(f'\n[deps] Done: {total_files} files, {total_edges} edges, '
+          f'{total_symbols} symbols, {skipped} skipped, {elapsed:.1f}s', file=sys.stderr)
+
+    return {
+        'files_processed': total_files,
+        'edges_stored': total_edges,
+        'symbols_stored': total_symbols,
+        'files_skipped': skipped,
+        'elapsed_seconds': round(elapsed, 1),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Index codebases for semantic search')
     parser.add_argument('--path', type=str, help='Path to repository root')
@@ -395,6 +546,8 @@ def main():
     parser.add_argument('--list', action='store_true', help='List indexed codebases')
     parser.add_argument('--remove', action='store_true', help='Remove a codebase (requires --name)')
     parser.add_argument('--model', type=str, default=DEFAULT_MODEL, help='Embedding model name')
+    parser.add_argument('--deps', action='store_true', help='Extract dependency graph (imports + symbols)')
+    parser.add_argument('--deps-only', action='store_true', help='Only extract dependencies, skip chunk embedding')
 
     args = parser.parse_args()
 
@@ -420,20 +573,29 @@ def main():
         print(f'Error: {repo_path} is not a directory', file=sys.stderr)
         sys.exit(1)
 
-    # Load model and quantization
-    model_name = args.model
-    dims = MODEL_DIMS.get(model_name, 384)
-    rotate_fn, codebook = load_quantization_params(conn, model_name, dims)
-    model = load_model(model_name)
+    # Chunk embedding pass (skip if --deps-only)
+    if not args.deps_only:
+        model_name = args.model
+        dims = MODEL_DIMS.get(model_name, 384)
+        rotate_fn, codebook = load_quantization_params(conn, model_name, dims)
+        model = load_model(model_name)
 
-    result = index_codebase(
-        conn, model, rotate_fn, codebook,
-        args.name, repo_path,
-        incremental=args.update,
-    )
+        result = index_codebase(
+            conn, model, rotate_fn, codebook,
+            args.name, repo_path,
+            incremental=args.update,
+        )
+        print(f'\nChunk indexing result: {result}')
+
+    # Dependency extraction pass
+    if args.deps or args.deps_only:
+        dep_result = index_dependencies(
+            conn, args.name, repo_path,
+            incremental=args.update,
+        )
+        print(f'\nDependency indexing result: {dep_result}')
 
     conn.close()
-    print(f'\nResult: {result}')
 
 
 if __name__ == '__main__':
