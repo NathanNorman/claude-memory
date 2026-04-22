@@ -39,6 +39,9 @@ MEMORY_DIR = HOME / '.claude-memory'
 DB_PATH = MEMORY_DIR / 'index' / 'memory.db'
 ARCHIVE_DIR = HOME / '.claude' / 'projects'
 CONV_PREFIX = 'conversations/'
+PLUGINS_JSON = HOME / '.claude' / 'plugins' / 'installed_plugins.json'
+SKILLS_DIR = HOME / '.claude' / 'skills'
+KNOWN_SOURCE_FILTERS = {'curated', 'conversations', 'codebase'}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +49,122 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 log = logging.getLogger('unified-memory')
+
+
+# ──────────────────────────────────────────────────────────────
+# Section 0: Addon Discovery
+# ──────────────────────────────────────────────────────────────
+
+# Module-level addon state (populated by discover_addon_dbs + init_addon_backends)
+addon_backends: dict[str, dict] = {}  # source_name -> {'flat': FlatSearchBackend, 'vector': VectorSearchBackend, 'db_path': Path}
+_addon_warmup_done = threading.Event()
+
+
+def _check_addon_model(db_path: Path, expected_model: str) -> bool:
+    """Check if an addon DB's embedding model matches the expected model.
+
+    Returns True if compatible, False if mismatched or unreadable.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'embedding_model'"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            log.warning(f'Skipping addon {db_path.name}: no embedding_model in meta table')
+            return False
+        db_model = row['value']
+        # Meta may store with prefix like 'Xenova/' — strip it
+        db_model_short = db_model.split('/')[-1] if '/' in db_model else db_model
+        if db_model_short != expected_model:
+            log.warning(
+                f'Skipping addon {db_path.name}: model mismatch '
+                f'({db_model_short} != {expected_model})'
+            )
+            return False
+        return True
+    except Exception as e:
+        log.warning(f'Skipping addon {db_path.name}: cannot read meta table: {e}')
+        return False
+
+
+def discover_addon_dbs(expected_model: str) -> dict[str, Path]:
+    """Discover addon .db files from plugins and local skills.
+
+    Returns a dict mapping source name to DB path.
+    Precedence: local skills > plugins (local shadows plugin on collision).
+    """
+    import glob as globmod
+
+    addons: dict[str, Path] = {}
+
+    # 1. Plugins (lower precedence)
+    if PLUGINS_JSON.exists():
+        try:
+            with open(PLUGINS_JSON) as f:
+                data = json.load(f)
+            for key, entries in data.get('plugins', {}).items():
+                plugin_name = key.split('@')[0]  # "toast-analytics@marketplace" -> "toast-analytics"
+                for entry in entries:
+                    install_path = entry.get('installPath', '')
+                    if not install_path or not Path(install_path).is_dir():
+                        continue
+                    for db_file in globmod.glob(
+                        str(Path(install_path) / '**' / '*.db'), recursive=True
+                    ):
+                        db_path = Path(db_file)
+                        source_name = f'{plugin_name}:{db_path.stem}'
+                        if _check_addon_model(db_path, expected_model):
+                            addons[source_name] = db_path
+                            log.info(f'Discovered plugin addon: {source_name} -> {db_path}')
+        except Exception as e:
+            log.warning(f'Failed to read installed_plugins.json: {e}')
+
+    # 2. Local skills (higher precedence — shadows plugins on stem collision)
+    if SKILLS_DIR.is_dir():
+        for db_file in globmod.glob(
+            str(SKILLS_DIR / '**' / '*.db'), recursive=True
+        ):
+            db_path = Path(db_file)
+            source_name = db_path.stem
+            if _check_addon_model(db_path, expected_model):
+                # Remove shadowed plugin entries
+                for existing_key in list(addons.keys()):
+                    if existing_key.endswith(f':{source_name}'):
+                        log.info(
+                            f'Local skill {source_name} shadows plugin {existing_key}'
+                        )
+                        del addons[existing_key]
+                addons[source_name] = db_path
+                log.info(f'Discovered local addon: {source_name} -> {db_path}')
+
+    return addons
+
+
+def init_addon_backends(discovered: dict[str, Path]) -> None:
+    """Initialize FlatSearchBackend + VectorSearchBackend for each addon DB.
+
+    Populates the module-level addon_backends dict.
+    """
+    global addon_backends
+    for source_name, db_path in discovered.items():
+        try:
+            flat = FlatSearchBackend(db_path, readonly=True)
+            flat._ensure_conn()
+            vec = VectorSearchBackend(db_path)
+            vec._ensure_index()
+            addon_backends[source_name] = {
+                'flat': flat,
+                'vector': vec,
+                'db_path': db_path,
+            }
+            log.info(f'Addon backend ready: {source_name}')
+        except Exception as e:
+            log.warning(f'Failed to init addon {source_name}: {e}')
 
 
 # ──────────────────────────────────────────────────────────────
@@ -61,9 +180,10 @@ class FlatSearchBackend:
     after memory_write operations.
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, readonly: bool = False):
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
+        self._readonly = readonly
 
     def _ensure_conn(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -73,7 +193,8 @@ class FlatSearchBackend:
             self._conn.execute('PRAGMA busy_timeout = 5000')
             self._conn.execute('PRAGMA journal_mode = WAL')
             self._conn.row_factory = sqlite3.Row
-            self._ensure_codebase_meta_table()
+            if not self._readonly:
+                self._ensure_codebase_meta_table()
         return self._conn
 
     def _ensure_codebase_meta_table(self) -> None:
@@ -1117,6 +1238,50 @@ flat_backend: Optional[FlatSearchBackend] = None
 vector_backend: Optional[VectorSearchBackend] = None
 
 
+def _search_addon(
+    query: str, source: str, max_results: int, min_score: float
+) -> dict:
+    """Run hybrid search against an addon database and return results."""
+    backends = addon_backends[source]
+    flat: FlatSearchBackend = backends['flat']
+    vec: VectorSearchBackend = backends['vector']
+    fetch_limit = max_results * 3
+
+    # Keyword search
+    flat_hits = flat.search_keyword(query, fetch_limit * 2)
+
+    # Vector search
+    vector_hits: list[dict] = []
+    try:
+        vector_hits = vec.search(query, fetch_limit * 2)
+    except Exception as e:
+        log.warning(f'Addon vector search failed for {source}: {e}')
+
+    # RRF merge
+    if vector_hits:
+        merged = FlatSearchBackend.merge_rrf(flat_hits, vector_hits)
+    else:
+        merged = flat_hits
+
+    # Format results
+    results = []
+    for r in merged[:max_results]:
+        score = r.get('score', 0)
+        if score < min_score:
+            continue
+        results.append({
+            'path': r['file_path'],
+            'title': r.get('title', ''),
+            'snippet': smart_truncate(r.get('content', ''), 800),
+            'score': round(score, 3),
+            'startLine': r.get('start_line'),
+            'endLine': r.get('end_line'),
+            'source': source,
+        })
+
+    return {'results': results}
+
+
 @mcp_app.tool()
 async def memory_search(
     query: str,
@@ -1140,8 +1305,16 @@ async def memory_search(
         after: Filter: only results after this date (YYYY-MM-DD)
         before: Filter: only results before this date (YYYY-MM-DD)
         project: Filter: only results from this project directory
-        source: Filter: "curated" for memory files only, "conversations" for session history only, empty for both
+        source: Filter: "curated" for memory files only, "conversations" for session history only, addon source name for addon databases, empty for primary only. Note: after/before/project filters are ignored for addon sources.
     """
+    # --- Addon source routing: route to addon DB exclusively ---
+    if source and source not in KNOWN_SOURCE_FILTERS:
+        # Wait for addon discovery to complete before checking (up to 30s)
+        _addon_warmup_done.wait(timeout=30)
+        if source in addon_backends:
+            return _search_addon(query, source, maxResults, minScore)
+        return {'error': f'Unknown source: {source}', 'results': []}
+
     if not flat_backend:
         return {'error': 'Flat search backend not available', 'results': []}
 
@@ -1572,6 +1745,22 @@ async def get_status() -> dict:
     else:
         result['vector'] = {'status': 'unavailable'}
 
+    # Addon backends
+    if addon_backends:
+        addons_status = {}
+        for name, backends in addon_backends.items():
+            try:
+                flat_stats = backends['flat'].get_stats()
+                vec_stats = backends['vector'].get_stats()
+                addons_status[name] = {
+                    'chunks': flat_stats.get('chunks', 0),
+                    'vectors': vec_stats.get('vectors', 0),
+                    'db_path': str(backends['db_path']),
+                }
+            except Exception:
+                addons_status[name] = {'status': 'error'}
+        result['addons'] = addons_status
+
     return result
 
 
@@ -1816,18 +2005,37 @@ async def run() -> None:
         log.warning(f'Vector backend init failed: {e}')
         vector_backend = None
 
-    # Warmup: pre-load model + index in background so first query is fast
-    if vector_backend is not None:
-        def _warmup():
-            try:
+    # Warmup: pre-load model + index + addon backends in background
+    def _warmup():
+        try:
+            if vector_backend is not None:
                 log.info('Warmup: pre-loading vector index and model...')
                 vector_backend._ensure_index()
                 vector_backend._ensure_model()
                 log.info('Warmup: vector backend ready')
-            except Exception as e:
-                log.warning(f'Warmup failed (non-fatal): {e}')
 
-        threading.Thread(target=_warmup, daemon=True, name='warmup').start()
+            # Discover and init addon databases
+            expected_model = (
+                vector_backend.MODEL_NAME if vector_backend
+                else VectorSearchBackend.DEFAULT_MODEL
+            )
+            discovered = discover_addon_dbs(expected_model)
+            if discovered:
+                log.info(f'Discovered {len(discovered)} addon database(s)')
+                init_addon_backends(discovered)
+                # Ensure model is loaded for addon vector backends
+                for name, backends in addon_backends.items():
+                    vec = backends.get('vector')
+                    if vec:
+                        vec._ensure_model()
+            else:
+                log.info('No addon databases found')
+        except Exception as e:
+            log.warning(f'Warmup failed (non-fatal): {e}')
+        finally:
+            _addon_warmup_done.set()
+
+    threading.Thread(target=_warmup, daemon=True, name='warmup').start()
 
     # Graceful shutdown
     def shutdown(sig=None, frame=None):
@@ -1836,6 +2044,12 @@ async def run() -> None:
             flat_backend.close()
         if vector_backend:
             vector_backend.close()
+        for name, backends in addon_backends.items():
+            try:
+                backends['flat'].close()
+                backends['vector'].close()
+            except Exception:
+                pass
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)

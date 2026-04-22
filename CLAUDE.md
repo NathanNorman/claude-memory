@@ -113,12 +113,39 @@ Source code from external repos can be indexed for semantic search via `codebase
 
 Codebase chunks are stored in the existing `chunks` table with `file_path` prefixed by `codebase:<name>/`. The `codebase_meta` table tracks per-file content hashes for incremental updates. A `PreToolUse:Write` hook (`~/.claude/hooks/checks/pre-write-codebase-check.py`) surfaces similar existing code when creating new source files.
 
+### Addon reference databases
+
+Skills and plugins can ship pre-built `.db` files containing searchable reference material (documentation, guides, API references). The server discovers these at startup and makes them searchable via `memory_search(source="<name>")`.
+
+**Discovery (mirrors Claude Code's skill resolution):**
+- Plugins: reads `~/.claude/plugins/installed_plugins.json`, globs `**/*.db` under each installPath → source name `plugin-name:stem`
+- Local skills: globs `~/.claude/skills/**/*.db` → source name is filename stem
+- Local skills shadow plugins on name collision
+
+**Source routing:** `source` parameter on `memory_search` routes to addon DBs exclusively — no cross-contamination with primary `memory.db`. Empty source = primary only.
+
+**Building addon databases:**
+
+```bash
+# Build from a directory of markdown/text files
+~/.claude-memory/graphiti-venv/bin/python3 ~/claude-memory/scripts/build-reference-db.py ./my-docs/ -o my-skill.db
+
+# Place next to SKILL.md
+cp my-skill.db ~/.claude/skills/my-skill/
+
+# Search via MCP
+memory_search(query="window functions", source="my-skill")
+```
+
+**Model compatibility:** Each addon DB stamps its embedding model in the `meta` table. Mismatched models are skipped at discovery time.
+
 ### Python scripts (`scripts/`)
 
 Standalone Python utilities, not part of the MCP server or Node.js indexer:
 - `conversation_parser.py` / `shared.py` — JSONL conversation parsing (Python equivalent of `src/conversation-parser.ts`)
 - `ingest_session.py` — One-off session ingestion script
 - `test_conversation_parser.py` — Tests for the Python parser
+- `build-reference-db.py` — Builds addon reference databases from directories of markdown/text files
 
 ## Key Design Decisions
 
