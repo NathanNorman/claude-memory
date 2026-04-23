@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 MAX_FILE_BYTES = 20 * 1024 * 1024  # 20MB
-MAX_OUTPUT_BYTES = 50 * 1024  # 50KB cap per conversation
 
 SKIP_TYPES = {'progress', 'queue-operation', 'file-history-snapshot'}
 SKIP_BLOCK_TYPES = {'tool_use', 'tool_result', 'thinking'}
@@ -186,38 +185,3 @@ def parse_conversation_jsonl(filepath: str) -> Optional[ParseResult]:
         cwd=cwd,
         timestamp=timestamp,
     )
-
-
-def format_for_graphiti(result: ParseResult, project_dir: str) -> str:
-    """
-    Format parsed conversation into text suitable for Graphiti episode ingestion.
-    Caps output at MAX_OUTPUT_BYTES.
-    """
-    parts = []
-
-    # Header
-    header = f"Session: {result.session_id or 'unknown'}"
-    header += f"\nProject: {project_dir}"
-    if result.cwd:
-        header += f" | CWD: {result.cwd}"
-    if result.timestamp:
-        header += f"\nDate: {result.timestamp[:10]}"
-    parts.append(header)
-
-    # Exchanges
-    total_size = len(header)
-    for ex in result.exchanges:
-        exchange_text = f"\n[User]: {ex.user_message}"
-        if ex.assistant_message:
-            exchange_text += f"\n[Assistant]: {ex.assistant_message}"
-        if ex.tool_names:
-            unique_tools = list(dict.fromkeys(ex.tool_names))  # dedup, preserve order
-            exchange_text += f"\n[Tools used]: {', '.join(unique_tools)}"
-
-        total_size += len(exchange_text.encode('utf-8'))
-        if total_size > MAX_OUTPUT_BYTES:
-            parts.append("\n[... truncated due to size limit ...]")
-            break
-        parts.append(exchange_text)
-
-    return '\n'.join(parts)

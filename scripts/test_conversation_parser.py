@@ -17,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from conversation_parser import (
     extract_message_text,
     parse_conversation_jsonl,
-    format_for_graphiti,
     ParseResult,
     ConversationExchange,
 )
@@ -103,46 +102,6 @@ class TestParseMinimalConversation(unittest.TestCase):
             self.assertIsNone(result)
         finally:
             os.unlink(tmp_path)
-
-
-class TestFormatForGraphiti(unittest.TestCase):
-    """Test structured output format."""
-
-    def test_format_includes_all_fields(self):
-        result = ParseResult(
-            exchanges=[
-                ConversationExchange(
-                    user_message='What is 2+2?',
-                    assistant_message='4',
-                    tool_names=['Calculator'],
-                ),
-            ],
-            session_id='test-session',
-            cwd='/home/test/project',
-            timestamp='2026-01-15T10:00:00Z',
-        )
-        text = format_for_graphiti(result, '-Users-nathan-norman-myproject')
-        self.assertIn('Session: test-session', text)
-        self.assertIn('Project: -Users-nathan-norman-myproject', text)
-        self.assertIn('Date: 2026-01-15', text)
-        self.assertIn('[User]: What is 2+2?', text)
-        self.assertIn('[Assistant]: 4', text)
-        self.assertIn('[Tools used]: Calculator', text)
-
-    def test_format_without_tools(self):
-        result = ParseResult(
-            exchanges=[
-                ConversationExchange(
-                    user_message='Hello',
-                    assistant_message='Hi there',
-                ),
-            ],
-            session_id='s1',
-        )
-        text = format_for_graphiti(result, 'test-project')
-        self.assertIn('[User]: Hello', text)
-        self.assertIn('[Assistant]: Hi there', text)
-        self.assertNotIn('[Tools used]', text)
 
 
 if __name__ == '__main__':
