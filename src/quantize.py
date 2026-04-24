@@ -470,3 +470,48 @@ def _unpack_general(packed: bytes, dims: int, bit_width: int) -> np.ndarray:
 def packed_size(dims: int, bit_width: int) -> int:
     """Return the byte size of a packed quantized vector."""
     return (dims * bit_width + 7) // 8
+
+
+# ──────────────────────────────────────────────────────────────
+# Binary (1-bit) quantization — sign-based, for Hamming coarse pass
+# ──────────────────────────────────────────────────────────────
+
+# Pre-computed popcount lookup table: number of set bits for each byte value 0-255
+_POPCOUNT_TABLE = np.array([bin(i).count('1') for i in range(256)], dtype=np.int32)
+
+
+def quantize_binary(vectors: np.ndarray) -> np.ndarray:
+    """Quantize float32 vectors to packed binary (1-bit per dimension).
+
+    Sign-based thresholding at zero: each dimension becomes 1 if positive,
+    0 if non-positive. Result is packed via np.packbits (big-endian).
+
+    Args:
+        vectors: float32 array of shape (N, d) or (d,).
+            If 1-D, treated as a single vector and reshaped to (1, d).
+
+    Returns:
+        uint8 array of shape (N, ceil(d/8)) — packed binary vectors.
+        For 768-d input, each row is 96 bytes.
+        For 384-d input, each row is 48 bytes.
+    """
+    if vectors.ndim == 1:
+        vectors = vectors.reshape(1, -1)
+    return np.packbits(vectors > 0, axis=1)
+
+
+def hamming_distance(binary_query: np.ndarray, binary_matrix: np.ndarray) -> np.ndarray:
+    """Compute Hamming distances between a packed binary query and a matrix.
+
+    Uses bitwise XOR followed by popcount via lookup table.
+
+    Args:
+        binary_query: uint8 array of shape (1, packed_dims) — single packed query
+        binary_matrix: uint8 array of shape (N, packed_dims) — packed binary matrix
+
+    Returns:
+        int32 array of shape (N,) — Hamming distance (number of differing bits)
+        between the query and each row in the matrix.
+    """
+    xor = np.bitwise_xor(binary_query, binary_matrix)
+    return _POPCOUNT_TABLE[xor].sum(axis=1)
