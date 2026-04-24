@@ -1,10 +1,11 @@
 """
-AST-based import, symbol, and call site extraction for Java, Kotlin, and Python.
+AST-based import, symbol, call site, and hierarchy extraction for Java, Kotlin, Python, and TypeScript.
 
-Uses tree-sitter for Java/Kotlin and stdlib ast for Python.
+Uses tree-sitter for Java/Kotlin/TypeScript and stdlib ast for Python.
 Extracts imports (with type classification), symbol declarations
 (classes, interfaces, enums, functions, methods) with line numbers,
-and function-level call sites for call graph construction.
+function-level call sites for call graph construction,
+and type hierarchy relationships (extends, implements, delegation).
 """
 
 import ast as python_ast
@@ -345,6 +346,336 @@ def extract_python_symbols(file_path: str) -> list[dict]:
 
 
 # ──────────────────────────────────────────────────────────────
+# Type hierarchy extraction helpers
+# ──────────────────────────────────────────────────────────────
+
+def _strip_generic_type(node) -> str:
+    """Extract base type name from a type node, stripping generic parameters.
+
+    For `Bar<Baz>` (generic_type), returns 'Bar'.
+    For plain `type_identifier` or `identifier`, returns the text directly.
+    """
+    if node.type == 'generic_type':
+        # First child is the base type identifier
+        for child in node.children:
+            if child.type in ('type_identifier', 'identifier'):
+                return child.text.decode()
+        return node.text.decode()
+    elif node.type in ('type_identifier', 'identifier'):
+        return node.text.decode()
+    # Fallback: scoped type like com.example.Foo
+    elif node.type == 'scoped_type_identifier':
+        return _scoped_identifier_text(node)
+    return node.text.decode()
+
+
+# ──────────────────────────────────────────────────────────────
+# Java hierarchy extraction
+# ──────────────────────────────────────────────────────────────
+
+def _extract_java_hierarchy(root_node, file_path: str) -> list[dict]:
+    """Walk Java AST to extract extends/implements relationships."""
+    results: list[dict] = []
+    _walk_java_hierarchy(root_node, file_path, results)
+    return results
+
+
+def _walk_java_hierarchy(node, file_path: str, results: list[dict]):
+    """Recursively walk Java AST for class/interface hierarchy."""
+    if node.type == 'class_declaration':
+        # Find class name
+        class_name = None
+        for child in node.children:
+            if child.type in ('identifier', 'type_identifier'):
+                class_name = child.text.decode()
+                break
+        if not class_name:
+            for child in node.children:
+                _walk_java_hierarchy(child, file_path, results)
+            return
+
+        # Extract superclass (extends)
+        for child in node.children:
+            if child.type == 'superclass':
+                for sc_child in child.children:
+                    if sc_child.type in ('type_identifier', 'generic_type', 'scoped_type_identifier'):
+                        parent = _strip_generic_type(sc_child)
+                        results.append({
+                            'class_name': class_name,
+                            'parent_name': parent,
+                            'relationship_type': 'extends',
+                            'parent_fqn_hint': None,
+                            'file_path': file_path,
+                            'line': node.start_point[0] + 1,
+                        })
+
+        # Extract interfaces (implements)
+        for child in node.children:
+            if child.type == 'super_interfaces':
+                for si_child in child.children:
+                    if si_child.type == 'type_list':
+                        for type_node in si_child.children:
+                            if type_node.type in ('type_identifier', 'generic_type', 'scoped_type_identifier'):
+                                parent = _strip_generic_type(type_node)
+                                results.append({
+                                    'class_name': class_name,
+                                    'parent_name': parent,
+                                    'relationship_type': 'implements',
+                                    'parent_fqn_hint': None,
+                                    'file_path': file_path,
+                                    'line': node.start_point[0] + 1,
+                                })
+
+    elif node.type == 'interface_declaration':
+        # Find interface name
+        iface_name = None
+        for child in node.children:
+            if child.type in ('identifier', 'type_identifier'):
+                iface_name = child.text.decode()
+                break
+        if not iface_name:
+            for child in node.children:
+                _walk_java_hierarchy(child, file_path, results)
+            return
+
+        # Extract extended interfaces
+        for child in node.children:
+            if child.type == 'extends_interfaces':
+                for ei_child in child.children:
+                    if ei_child.type == 'type_list':
+                        for type_node in ei_child.children:
+                            if type_node.type in ('type_identifier', 'generic_type', 'scoped_type_identifier'):
+                                parent = _strip_generic_type(type_node)
+                                results.append({
+                                    'class_name': iface_name,
+                                    'parent_name': parent,
+                                    'relationship_type': 'extends',
+                                    'parent_fqn_hint': None,
+                                    'file_path': file_path,
+                                    'line': node.start_point[0] + 1,
+                                })
+
+    for child in node.children:
+        _walk_java_hierarchy(child, file_path, results)
+
+
+# ──────────────────────────────────────────────────────────────
+# Kotlin hierarchy extraction
+# ──────────────────────────────────────────────────────────────
+
+def _extract_kotlin_hierarchy(root_node, file_path: str) -> list[dict]:
+    """Walk Kotlin AST to extract extends/implements/delegation relationships."""
+    results: list[dict] = []
+    _walk_kotlin_hierarchy(root_node, file_path, results)
+    return results
+
+
+def _walk_kotlin_hierarchy(node, file_path: str, results: list[dict]):
+    """Recursively walk Kotlin AST for class/object hierarchy."""
+    if node.type in ('class_declaration', 'object_declaration'):
+        # Find class/object name
+        class_name = None
+        for child in node.children:
+            if child.type == 'type_identifier':
+                class_name = child.text.decode()
+                break
+        if not class_name:
+            for child in node.children:
+                _walk_kotlin_hierarchy(child, file_path, results)
+            return
+
+        # Inspect delegation_specifier children
+        for child in node.children:
+            if child.type != 'delegation_specifier':
+                continue
+
+            # Check what kind of delegation this is
+            for spec_child in child.children:
+                if spec_child.type == 'constructor_invocation':
+                    # extends (superclass with constructor call)
+                    for ci_child in spec_child.children:
+                        if ci_child.type == 'user_type':
+                            parent = _extract_kotlin_user_type(ci_child)
+                            results.append({
+                                'class_name': class_name,
+                                'parent_name': parent,
+                                'relationship_type': 'extends',
+                                'parent_fqn_hint': None,
+                                'file_path': file_path,
+                                'line': node.start_point[0] + 1,
+                            })
+                            break
+
+                elif spec_child.type == 'explicit_delegation':
+                    # delegation (by keyword)
+                    for ed_child in spec_child.children:
+                        if ed_child.type == 'user_type':
+                            parent = _extract_kotlin_user_type(ed_child)
+                            results.append({
+                                'class_name': class_name,
+                                'parent_name': parent,
+                                'relationship_type': 'delegation',
+                                'parent_fqn_hint': None,
+                                'file_path': file_path,
+                                'line': node.start_point[0] + 1,
+                            })
+                            break
+
+                elif spec_child.type == 'user_type':
+                    # implements (bare user_type = interface)
+                    parent = _extract_kotlin_user_type(spec_child)
+                    results.append({
+                        'class_name': class_name,
+                        'parent_name': parent,
+                        'relationship_type': 'implements',
+                        'parent_fqn_hint': None,
+                        'file_path': file_path,
+                        'line': node.start_point[0] + 1,
+                    })
+
+    for child in node.children:
+        _walk_kotlin_hierarchy(child, file_path, results)
+
+
+def _extract_kotlin_user_type(user_type_node) -> str:
+    """Extract the type name from a Kotlin user_type node, stripping generics."""
+    for child in user_type_node.children:
+        if child.type == 'type_identifier':
+            return child.text.decode()
+    return user_type_node.text.decode()
+
+
+# ──────────────────────────────────────────────────────────────
+# Python hierarchy extraction
+# ──────────────────────────────────────────────────────────────
+
+def _extract_python_hierarchy(tree, file_path: str) -> list[dict]:
+    """Extract extends relationships from Python AST using stdlib ast."""
+    results: list[dict] = []
+    for node in python_ast.walk(tree):
+        if not isinstance(node, python_ast.ClassDef):
+            continue
+        for base in node.bases:
+            parent = _python_base_name(base)
+            if parent:
+                results.append({
+                    'class_name': node.name,
+                    'parent_name': parent,
+                    'relationship_type': 'extends',
+                    'parent_fqn_hint': None,
+                    'file_path': file_path,
+                    'line': node.lineno,
+                })
+    return results
+
+
+def _python_base_name(node) -> str | None:
+    """Extract parent class name from a Python base node.
+
+    Handles ast.Name ('Bar'), ast.Attribute ('module.Bar'),
+    and ast.Subscript ('List[str]' -> 'List').
+    """
+    if isinstance(node, python_ast.Name):
+        return node.id
+    elif isinstance(node, python_ast.Attribute):
+        # Dotted name like module.Bar
+        parts = []
+        current = node
+        while isinstance(current, python_ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, python_ast.Name):
+            parts.append(current.id)
+        return '.'.join(reversed(parts))
+    elif isinstance(node, python_ast.Subscript):
+        # Generic like List[str] — unwrap to get base type
+        return _python_base_name(node.value)
+    return None
+
+
+# ──────────────────────────────────────────────────────────────
+# TypeScript hierarchy extraction
+# ──────────────────────────────────────────────────────────────
+
+def _extract_typescript_hierarchy(root_node, file_path: str) -> list[dict]:
+    """Walk TypeScript AST to extract extends/implements relationships."""
+    results: list[dict] = []
+    _walk_typescript_hierarchy(root_node, file_path, results)
+    return results
+
+
+def _walk_typescript_hierarchy(node, file_path: str, results: list[dict]):
+    """Recursively walk TypeScript AST for class/interface hierarchy."""
+    if node.type == 'class_declaration':
+        # Find class name
+        class_name = None
+        for child in node.children:
+            if child.type == 'type_identifier':
+                class_name = child.text.decode()
+                break
+        if not class_name:
+            for child in node.children:
+                _walk_typescript_hierarchy(child, file_path, results)
+            return
+
+        # Process class_heritage children
+        for child in node.children:
+            if child.type == 'class_heritage':
+                for heritage_child in child.children:
+                    if heritage_child.type == 'extends_clause':
+                        _extract_ts_clause_types(heritage_child, class_name, 'extends', file_path, node, results)
+                    elif heritage_child.type == 'implements_clause':
+                        _extract_ts_clause_types(heritage_child, class_name, 'implements', file_path, node, results)
+
+    elif node.type == 'interface_declaration':
+        # Find interface name
+        iface_name = None
+        for child in node.children:
+            if child.type == 'type_identifier':
+                iface_name = child.text.decode()
+                break
+        if not iface_name:
+            for child in node.children:
+                _walk_typescript_hierarchy(child, file_path, results)
+            return
+
+        # Process extends_type_clause
+        for child in node.children:
+            if child.type == 'extends_type_clause':
+                _extract_ts_clause_types(child, iface_name, 'extends', file_path, node, results)
+
+    for child in node.children:
+        _walk_typescript_hierarchy(child, file_path, results)
+
+
+def _extract_ts_clause_types(
+    clause_node, class_name: str, rel_type: str,
+    file_path: str, decl_node, results: list[dict],
+):
+    """Extract type names from a TypeScript extends/implements/extends_type clause."""
+    for child in clause_node.children:
+        if child.type in ('type_identifier', 'identifier'):
+            results.append({
+                'class_name': class_name,
+                'parent_name': child.text.decode(),
+                'relationship_type': rel_type,
+                'parent_fqn_hint': None,
+                'file_path': file_path,
+                'line': decl_node.start_point[0] + 1,
+            })
+        elif child.type == 'generic_type':
+            parent = _strip_generic_type(child)
+            results.append({
+                'class_name': class_name,
+                'parent_name': parent,
+                'relationship_type': rel_type,
+                'parent_fqn_hint': None,
+                'file_path': file_path,
+                'line': decl_node.start_point[0] + 1,
+            })
+
+
+# ──────────────────────────────────────────────────────────────
 # Unified dispatch
 # ──────────────────────────────────────────────────────────────
 
@@ -598,5 +929,34 @@ def extract_call_sites(file_path: str, source_code: str | bytes, language: str, 
             return extract_python_call_sites(file_path, source_code, symbols)
     except Exception as e:
         logger.warning(f'Call extraction failed for {file_path}: {e}')
+        return []
+    return []
+
+
+def extract_hierarchy(file_path: str, source_code: str, language: str) -> list[dict]:
+    """Extract type hierarchy (extends/implements/delegation) from source code.
+
+    Dispatches to language-specific extractors. Returns a list of dicts with keys:
+    class_name, parent_name, relationship_type, parent_fqn_hint, file_path, line.
+
+    Returns empty list on parse failure or unsupported language.
+    """
+    try:
+        if language == 'java':
+            parser = _get_parser('java')
+            tree = parser.parse(source_code.encode())
+            return _extract_java_hierarchy(tree.root_node, file_path)
+        elif language == 'kotlin':
+            parser = _get_parser('kotlin')
+            tree = parser.parse(source_code.encode())
+            return _extract_kotlin_hierarchy(tree.root_node, file_path)
+        elif language == 'python':
+            py_tree = python_ast.parse(source_code)
+            return _extract_python_hierarchy(py_tree, file_path)
+        elif language == 'typescript':
+            parser = _get_parser('typescript')
+            tree = parser.parse(source_code.encode())
+            return _extract_typescript_hierarchy(tree.root_node, file_path)
+    except Exception:
         return []
     return []

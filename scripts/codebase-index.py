@@ -426,7 +426,7 @@ def ensure_dep_tables(conn: sqlite3.Connection) -> None:
 
 
 # Extensions that support dependency extraction
-DEP_EXTENSIONS = {'.java', '.kt', '.py'}
+DEP_EXTENSIONS = {'.java', '.kt', '.py', '.ts'}
 
 
 def index_dependencies(
@@ -435,8 +435,8 @@ def index_dependencies(
     repo_path: Path,
     incremental: bool = False,
 ) -> dict:
-    """Extract imports and symbols from source files and store as edges/symbols."""
-    from ast_parser import extract_imports, extract_symbols
+    """Extract imports, symbols, and type hierarchy from source files and store as edges/symbols."""
+    from ast_parser import extract_imports, extract_symbols, extract_hierarchy
     from import_resolver import resolve_import, clear_cache
 
     clear_cache()
@@ -479,7 +479,7 @@ def index_dependencies(
             continue
 
         # Determine language from extension
-        lang = {'java': 'java', 'kt': 'kotlin', 'py': 'python'}.get(fpath.suffix.lstrip('.'))
+        lang = {'java': 'java', 'kt': 'kotlin', 'py': 'python', 'ts': 'typescript'}.get(fpath.suffix.lstrip('.'))
         if not lang:
             continue
 
@@ -518,6 +518,34 @@ def index_dependencies(
                 (sym_id, name, rel, sym['name'], sym['kind'], sym['start_line'], sym['end_line'], now_ts),
             )
             total_symbols += 1
+
+        # Extract type hierarchy (extends/implements/delegation)
+        try:
+            source_code = fpath.read_text(errors='replace')
+            hierarchy = extract_hierarchy(str(fpath), source_code, lang)
+        except Exception as e:
+            print(f'[deps] Hierarchy parse failed {rel}: {e}', file=sys.stderr)
+            hierarchy = []
+
+        # Build import map for parent name resolution: simple_name -> FQN
+        import_map: dict[str, str] = {}
+        for imp in imports:
+            fqn = imp['import_name']
+            if not fqn.endswith('.*'):
+                simple = fqn.rsplit('.', 1)[-1]
+                import_map[simple] = fqn
+
+        for hier in hierarchy:
+            parent = hier['parent_name']
+            # Try to resolve parent via import map
+            parent_fqn = import_map.get(parent, parent)
+            target = resolve_import(parent_fqn, repo_str, lang)
+            conn.execute(
+                'INSERT INTO edges (codebase, source_file, target_file, edge_type, metadata, updated_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (name, rel, target, hier['relationship_type'], parent, now_ts),
+            )
+            total_edges += 1
 
         total_files += 1
 
@@ -727,6 +755,57 @@ def index_call_graph(
     }
 
 
+def resolve_hierarchy_edges(conn: sqlite3.Connection) -> dict:
+    """Resolve unresolved hierarchy edges by matching parent names against the symbols table.
+
+    Queries hierarchy edges (extends/implements/delegation) where target_file IS NULL,
+    then looks up the parent name in metadata against symbols across all codebases.
+    Updates target_file for matches found.
+    """
+    ensure_dep_tables(conn)
+
+    # Find unresolved hierarchy edges
+    unresolved = conn.execute(
+        'SELECT id, metadata, codebase FROM edges '
+        'WHERE target_file IS NULL AND edge_type IN (?, ?, ?)',
+        ('extends', 'implements', 'delegation'),
+    ).fetchall()
+
+    if not unresolved:
+        print('[resolve-hierarchy] No unresolved hierarchy edges found.', file=sys.stderr)
+        return {'resolved': 0, 'unresolved': 0}
+
+    resolved = 0
+    still_unresolved = 0
+
+    for row in unresolved:
+        parent_name = row['metadata']
+        edge_id = row['id']
+
+        # Look up parent name in symbols table across all codebases
+        sym = conn.execute(
+            'SELECT file_path, codebase FROM symbols WHERE name = ? LIMIT 1',
+            (parent_name,),
+        ).fetchone()
+
+        if sym:
+            # Construct the full path as codebase:file_path
+            target = f"codebase:{sym['codebase']}/{sym['file_path']}"
+            conn.execute(
+                'UPDATE edges SET target_file = ? WHERE id = ?',
+                (target, edge_id),
+            )
+            resolved += 1
+        else:
+            still_unresolved += 1
+
+    conn.commit()
+    print(f'[resolve-hierarchy] Resolved {resolved}, still unresolved {still_unresolved}',
+          file=sys.stderr)
+
+    return {'resolved': resolved, 'unresolved': still_unresolved}
+
+
 def main():
     parser = argparse.ArgumentParser(description='Index codebases for semantic search')
     parser.add_argument('--path', type=str, help='Path to repository root')
@@ -735,9 +814,11 @@ def main():
     parser.add_argument('--list', action='store_true', help='List indexed codebases')
     parser.add_argument('--remove', action='store_true', help='Remove a codebase (requires --name)')
     parser.add_argument('--model', type=str, default=DEFAULT_MODEL, help='Embedding model name')
-    parser.add_argument('--deps', action='store_true', help='Extract dependency graph (imports + symbols)')
+    parser.add_argument('--deps', action='store_true', help='Extract dependency graph (imports + symbols + hierarchy)')
     parser.add_argument('--deps-only', action='store_true', help='Only extract dependencies, skip chunk embedding')
     parser.add_argument('--calls', action='store_true', help='Extract call graph (function-level call edges)')
+    parser.add_argument('--resolve-hierarchy', action='store_true',
+                        help='Resolve unresolved hierarchy edges against symbols table across all codebases')
 
     args = parser.parse_args()
 
@@ -752,6 +833,12 @@ def main():
         if not args.name:
             parser.error('--remove requires --name')
         remove_codebase(conn, args.name)
+        conn.close()
+        return
+
+    if args.resolve_hierarchy:
+        result = resolve_hierarchy_edges(conn)
+        print(f'\nHierarchy resolution result: {result}')
         conn.close()
         return
 
