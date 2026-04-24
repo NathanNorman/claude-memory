@@ -578,6 +578,10 @@ class VectorSearchBackend:
     DEFAULT_BIT_WIDTH = 4
     RERANK_K = 30  # Candidates for exact reranking
 
+    # Dual-model architecture: CodeRankEmbed for codebase, bge-base for memory
+    CODEBASE_EMBEDDING_MODEL = 'nomic-ai/CodeRankEmbed'
+    CODEBASE_QUERY_PREFIX = 'Represent this query for searching relevant code: '
+
     # Model name → embedding dimensions
     MODEL_DIMS = {
         'all-MiniLM-L6-v2': 384,
@@ -585,15 +589,17 @@ class VectorSearchBackend:
         'bge-base-en-v1.5': 768,
         'all-mpnet-base-v2': 768,
         'bge-large-en-v1.5': 1024,
+        'nomic-ai/CodeRankEmbed': 768,
     }
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
         self._model = None
+        self._codebase_model = None  # Lazy-loaded CodeRankEmbed for codebase queries
         self._init_failed = False
 
-        # Configurable model via env var
+        # Configurable model via env var (for memory/conversation)
         self.MODEL_NAME = os.environ.get('MEMORY_EMBEDDING_MODEL', self.DEFAULT_MODEL)
         self.EMBEDDING_DIMS = self.MODEL_DIMS.get(self.MODEL_NAME, 384)
         # In-memory embedding index (lazy-loaded)
@@ -677,7 +683,7 @@ class VectorSearchBackend:
             return False
 
     def _check_model_version(self, conn: sqlite3.Connection) -> None:
-        """Check if configured model matches what's in the meta table."""
+        """Check if configured models match what's in the meta table."""
         try:
             row = conn.execute(
                 "SELECT value FROM meta WHERE key = 'embedding_model'"
@@ -688,11 +694,27 @@ class VectorSearchBackend:
                 db_model_short = db_model.split('/')[-1] if '/' in db_model else db_model
                 if db_model_short != self.MODEL_NAME:
                     log.warning(
-                        f'Model mismatch: DB has {db_model}, configured {self.MODEL_NAME}. '
+                        f'Memory model mismatch: DB has {db_model}, configured {self.MODEL_NAME}. '
                         f'Run a full reindex to update embeddings.'
                     )
         except Exception:
             pass  # meta table may not exist yet
+
+        # Check codebase model separately (does NOT trigger memory reindex)
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'codebase_embedding_model'"
+            ).fetchone()
+            if row:
+                cb_model = row['value']
+                if cb_model != self.CODEBASE_EMBEDDING_MODEL:
+                    log.warning(
+                        f'Codebase model mismatch: DB has {cb_model}, '
+                        f'configured {self.CODEBASE_EMBEDDING_MODEL}. '
+                        f'Run codebase-index.py to reindex codebase chunks.'
+                    )
+        except Exception:
+            pass
 
     def _ensure_index(self) -> bool:
         """Load all embeddings from chunks table into memory.
@@ -808,6 +830,113 @@ class VectorSearchBackend:
             log.warning(f'Vector backend model load failed: {e}')
             self._init_failed = True
             return None
+
+    def _ensure_codebase_model(self):
+        """Lazy-load CodeRankEmbed for codebase queries on first call."""
+        if self._codebase_model is not None:
+            return self._codebase_model
+        if self._init_failed:
+            return None
+        try:
+            from sentence_transformers import SentenceTransformer
+            repo_id = self.CODEBASE_EMBEDDING_MODEL
+            self._codebase_model = SentenceTransformer(repo_id)
+            log.info(f'Vector backend: loaded {repo_id} codebase model')
+            return self._codebase_model
+        except Exception as e:
+            log.warning(f'Codebase model load failed: {e}')
+            return None
+
+    def search_codebase(self, query: str, limit: int) -> list[dict]:
+        """Vector search for codebase queries using CodeRankEmbed + query prefix.
+
+        Uses the codebase-specific model with asymmetric query prefix.
+        Falls back to the default model if CodeRankEmbed is unavailable.
+        """
+        if self._init_failed or limit <= 0:
+            return []
+
+        if not self._ensure_index():
+            return []
+
+        # Try CodeRankEmbed first, fall back to default model
+        model = self._ensure_codebase_model()
+        if model is None:
+            model = self._ensure_model()
+        if model is None:
+            return []
+
+        import numpy as np
+        from quantize import batch_quantized_dot_products
+
+        # Apply asymmetric query prefix for CodeRankEmbed
+        prefixed_query = self.CODEBASE_QUERY_PREFIX + query
+        query_vec = model.encode(prefixed_query, normalize_embeddings=True)
+        query_vec = np.array(query_vec, dtype=np.float32).flatten()
+
+        if self._quantized and self._packed_list:
+            from quantize import dequantize
+
+            query_rotated = self._rotate_fn(query_vec)
+            approx_sims = batch_quantized_dot_products(
+                query_rotated, self._packed_list, self._codebook,
+                self.EMBEDDING_DIMS,
+            )
+            rerank_k = max(self.RERANK_K, limit * 3)
+            rerank_k = min(rerank_k, len(approx_sims))
+            candidate_indices = np.argsort(approx_sims)[-rerank_k:]
+
+            candidate_vecs = []
+            for ci in candidate_indices:
+                deq = dequantize(
+                    self._packed_list[ci], self._inv_rotate_fn,
+                    self._codebook, self.EMBEDDING_DIMS,
+                )
+                norm = np.linalg.norm(deq)
+                if norm > 0:
+                    deq = deq / norm
+                candidate_vecs.append(deq)
+            candidate_matrix = np.array(candidate_vecs, dtype=np.float32)
+
+            exact_sims = candidate_matrix @ query_vec
+            top_within = np.argsort(exact_sims)[-limit:][::-1]
+            top_indices = [candidate_indices[j] for j in top_within]
+            similarities = np.array([exact_sims[j] for j in top_within])
+        else:
+            query_vec_2d = query_vec.reshape(1, -1)
+            all_sims = (self._matrix @ query_vec_2d.T).flatten()
+            top_k = min(limit, len(all_sims))
+            top_indices = np.argpartition(all_sims, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(all_sims[top_indices])[::-1]]
+            similarities = all_sims[top_indices]
+
+        conn = self._ensure_conn()
+        if conn is None:
+            return []
+
+        results = []
+        for idx, score in zip(top_indices, similarities):
+            score = float(score)
+            if score <= 0:
+                continue
+            rowid = self._rowids[idx]
+            chunk = conn.execute(
+                'SELECT id, file_path, chunk_index, start_line, end_line, '
+                'title, content FROM chunks WHERE rowid = ?',
+                (rowid,),
+            ).fetchone()
+            if chunk:
+                results.append({
+                    'id': chunk['id'],
+                    'file_path': chunk['file_path'],
+                    'chunk_index': chunk['chunk_index'],
+                    'start_line': chunk['start_line'],
+                    'end_line': chunk['end_line'],
+                    'title': chunk['title'],
+                    'content': chunk['content'],
+                    'score': score,
+                })
+        return results
 
     def search(self, query: str, limit: int) -> list[dict]:
         """Vector similarity search with optional quantized acceleration.
@@ -1008,6 +1137,7 @@ class VectorSearchBackend:
         self._rotate_fn = None
         self._inv_rotate_fn = None
         self._codebook = None
+        self._codebase_model = None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1325,10 +1455,14 @@ async def memory_search(
     flat_original = flat_backend.search_keyword(query, fetch_limit * 2)
 
     # Vector similarity search — synchronous, first call loads model (~2s), then fast
+    # Use CodeRankEmbed with query prefix when searching codebase source
     vector_hits: list[dict] = []
     if vector_backend:
         try:
-            vector_hits = vector_backend.search(query, fetch_limit * 2)
+            if source == 'codebase':
+                vector_hits = vector_backend.search_codebase(query, fetch_limit * 2)
+            else:
+                vector_hits = vector_backend.search(query, fetch_limit * 2)
         except Exception as e:
             log.warning(f'Vector search failed: {e}')
 
@@ -1456,11 +1590,11 @@ async def codebase_search(
     flat_hits = flat_backend.search_keyword(query, fetch_limit * 2)
     flat_hits = [h for h in flat_hits if h['file_path'].startswith(prefix)]
 
-    # Vector search
+    # Vector search — use CodeRankEmbed with query prefix for codebase
     vector_hits: list[dict] = []
     if vector_backend:
         try:
-            all_vec = vector_backend.search(query, fetch_limit * 2)
+            all_vec = vector_backend.search_codebase(query, fetch_limit * 2)
             vector_hits = [h for h in all_vec if h['file_path'].startswith(prefix)]
         except Exception as e:
             log.warning(f'Vector search failed in codebase_search: {e}')
