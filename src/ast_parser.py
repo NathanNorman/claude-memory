@@ -1,14 +1,18 @@
 """
-AST-based import and symbol extraction for Java, Kotlin, and Python.
+AST-based import, symbol, and call site extraction for Java, Kotlin, and Python.
 
 Uses tree-sitter for Java/Kotlin and stdlib ast for Python.
-Extracts imports (with type classification) and symbol declarations
-(classes, interfaces, enums, functions, methods) with line numbers.
+Extracts imports (with type classification), symbol declarations
+(classes, interfaces, enums, functions, methods) with line numbers,
+and function-level call sites for call graph construction.
 """
 
 import ast as python_ast
+import logging
 import warnings
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 warnings.filterwarnings('ignore', category=FutureWarning, module='tree_sitter')
 
@@ -363,4 +367,236 @@ def extract_symbols(file_path: str) -> list[dict]:
         return extract_kotlin_symbols(file_path)
     elif file_path.endswith('.py'):
         return extract_python_symbols(file_path)
+    return []
+
+
+# ──────────────────────────────────────────────────────────────
+# Call site extraction
+# ──────────────────────────────────────────────────────────────
+
+def _find_enclosing_symbol(symbols: list[dict], line: int) -> str:
+    """Return the innermost symbol whose line range contains the given line.
+
+    Returns '<module>' if no enclosing symbol is found.
+    """
+    best = None
+    best_span = float('inf')
+    for sym in symbols:
+        if sym['start_line'] <= line <= sym['end_line']:
+            span = sym['end_line'] - sym['start_line']
+            if span < best_span:
+                best = sym['name']
+                best_span = span
+    return best if best is not None else '<module>'
+
+
+def extract_java_call_sites(file_path: str, source_code: bytes, symbols: list[dict]) -> list[dict]:
+    """Extract call sites from a Java file using tree-sitter.
+
+    Queries for method_invocation and object_creation_expression nodes.
+    """
+    parser = _get_parser('java')
+    tree = parser.parse(source_code)
+    calls: list[dict] = []
+    _walk_java_calls(tree.root_node, file_path, symbols, calls)
+    return calls
+
+
+def _walk_java_calls(node, file_path: str, symbols: list[dict], calls: list[dict]):
+    """Recursively walk Java AST to extract call sites."""
+    if node.type == 'method_invocation':
+        # Structure: [object.]method(args)
+        # Children: [receiver, '.', method_name, argument_list]
+        callee_name = None
+        callee_receiver = None
+
+        # Find the method name (identifier child) and receiver
+        children = list(node.children)
+        for i, child in enumerate(children):
+            if child.type == 'identifier' and i > 0:
+                # This identifier follows something — it's the method name
+                callee_name = child.text.decode()
+            elif child.type == 'identifier' and i == 0:
+                # First identifier could be receiver or bare method name
+                # Check if next non-dot child is also an identifier
+                callee_name = child.text.decode()
+            elif child.type == 'field_access':
+                callee_receiver = child.text.decode()
+
+        # If there's a dot, the first part is receiver, second is method
+        dot_indices = [i for i, c in enumerate(children) if c.type == '.']
+        if dot_indices:
+            # Everything before the dot is receiver
+            receiver_parts = []
+            for c in children[:dot_indices[0]]:
+                if c.type not in ('argument_list', '(', ')', '.'):
+                    receiver_parts.append(c.text.decode())
+            if receiver_parts:
+                callee_receiver = '.'.join(receiver_parts)
+            # Method name is identifier after last dot
+            for c in children[dot_indices[-1] + 1:]:
+                if c.type == 'identifier':
+                    callee_name = c.text.decode()
+                    break
+
+        if callee_name:
+            line = node.start_point[0] + 1
+            calls.append({
+                'file_path': file_path,
+                'caller_symbol': _find_enclosing_symbol(symbols, line),
+                'callee_name': callee_name,
+                'callee_receiver': callee_receiver,
+                'line': line,
+            })
+
+    elif node.type == 'object_creation_expression':
+        # Constructor call: new ClassName(args)
+        # Find the type_identifier child
+        for child in node.children:
+            if child.type == 'type_identifier':
+                line = node.start_point[0] + 1
+                calls.append({
+                    'file_path': file_path,
+                    'caller_symbol': _find_enclosing_symbol(symbols, line),
+                    'callee_name': child.text.decode(),
+                    'callee_receiver': None,
+                    'line': line,
+                })
+                break
+
+    for child in node.children:
+        _walk_java_calls(child, file_path, symbols, calls)
+
+
+def extract_kotlin_call_sites(file_path: str, source_code: bytes, symbols: list[dict]) -> list[dict]:
+    """Extract call sites from a Kotlin file using tree-sitter.
+
+    Handles call_expression with navigation_expression (receiver.method)
+    and simple_identifier (bare function call) forms.
+    """
+    parser = _get_parser('kotlin')
+    tree = parser.parse(source_code)
+    calls: list[dict] = []
+    _walk_kotlin_calls(tree.root_node, file_path, symbols, calls)
+    return calls
+
+
+def _walk_kotlin_calls(node, file_path: str, symbols: list[dict], calls: list[dict]):
+    """Recursively walk Kotlin AST to extract call sites."""
+    if node.type == 'call_expression':
+        callee_name = None
+        callee_receiver = None
+
+        # First child is what's being called
+        if node.children:
+            target = node.children[0]
+            if target.type == 'navigation_expression':
+                # receiver.method form
+                parts = []
+                for child in target.children:
+                    if child.type == 'simple_identifier':
+                        parts.append(child.text.decode())
+                    elif child.type == 'navigation_suffix':
+                        for sc in child.children:
+                            if sc.type == 'simple_identifier':
+                                parts.append(sc.text.decode())
+                if len(parts) >= 2:
+                    callee_receiver = '.'.join(parts[:-1])
+                    callee_name = parts[-1]
+                elif len(parts) == 1:
+                    callee_name = parts[0]
+            elif target.type == 'simple_identifier':
+                callee_name = target.text.decode()
+
+        if callee_name:
+            line = node.start_point[0] + 1
+            calls.append({
+                'file_path': file_path,
+                'caller_symbol': _find_enclosing_symbol(symbols, line),
+                'callee_name': callee_name,
+                'callee_receiver': callee_receiver,
+                'line': line,
+            })
+
+    for child in node.children:
+        _walk_kotlin_calls(child, file_path, symbols, calls)
+
+
+def _resolve_python_call_func(node) -> tuple[str | None, str | None]:
+    """Resolve a Python ast.Call func node into (callee_name, callee_receiver).
+
+    Handles Name (bare), Attribute (dotted), and nested attribute access.
+    """
+    if isinstance(node, python_ast.Name):
+        return node.id, None
+    elif isinstance(node, python_ast.Attribute):
+        # Recursively resolve the value to build the receiver chain
+        parts = []
+        current = node
+        while isinstance(current, python_ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, python_ast.Name):
+            parts.append(current.id)
+        parts.reverse()
+        if len(parts) >= 2:
+            return parts[-1], '.'.join(parts[:-1])
+        elif len(parts) == 1:
+            return parts[0], None
+    return None, None
+
+
+def extract_python_call_sites(file_path: str, source_code: str, symbols: list[dict]) -> list[dict]:
+    """Extract call sites from a Python file using stdlib ast.Call."""
+    try:
+        tree = python_ast.parse(source_code)
+    except SyntaxError:
+        return []
+
+    calls: list[dict] = []
+    for node in python_ast.walk(tree):
+        if isinstance(node, python_ast.Call):
+            callee_name, callee_receiver = _resolve_python_call_func(node.func)
+            if callee_name:
+                line = node.lineno
+                calls.append({
+                    'file_path': file_path,
+                    'caller_symbol': _find_enclosing_symbol(symbols, line),
+                    'callee_name': callee_name,
+                    'callee_receiver': callee_receiver,
+                    'line': line,
+                })
+
+    return calls
+
+
+def extract_call_sites(file_path: str, source_code: str | bytes, language: str, symbols: list[dict]) -> list[dict]:
+    """Extract call sites from a file, dispatching by language.
+
+    Args:
+        file_path: Path to the source file
+        source_code: File contents (str for Python, bytes for Java/Kotlin)
+        language: One of 'java', 'kotlin', 'python'
+        symbols: Symbol list from extract_symbols() for caller identification
+
+    Returns:
+        List of call site dicts with keys: file_path, caller_symbol, callee_name,
+        callee_receiver (may be None), line
+    """
+    try:
+        if language == 'java':
+            if isinstance(source_code, str):
+                source_code = source_code.encode()
+            return extract_java_call_sites(file_path, source_code, symbols)
+        elif language == 'kotlin':
+            if isinstance(source_code, str):
+                source_code = source_code.encode()
+            return extract_kotlin_call_sites(file_path, source_code, symbols)
+        elif language == 'python':
+            if isinstance(source_code, bytes):
+                source_code = source_code.decode(errors='replace')
+            return extract_python_call_sites(file_path, source_code, symbols)
+    except Exception as e:
+        logger.warning(f'Call extraction failed for {file_path}: {e}')
+        return []
     return []
