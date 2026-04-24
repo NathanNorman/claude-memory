@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import hashlib
+import json
 import os
 import sqlite3
 import struct
@@ -416,6 +417,11 @@ def ensure_dep_tables(conn: sqlite3.Connection) -> None:
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name, codebase)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path, codebase)')
+    # Add confidence column to edges table (idempotent migration)
+    try:
+        conn.execute('ALTER TABLE edges ADD COLUMN confidence REAL')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
 
 
@@ -538,6 +544,189 @@ def index_dependencies(
     }
 
 
+def build_symbol_table(conn: sqlite3.Connection, codebase_name: str) -> dict[str, list[dict]]:
+    """Load all symbols from the DB into the dict format the resolver expects.
+
+    Returns: dict mapping symbol name -> list of {file_path, kind, start_line, end_line}
+    """
+    rows = conn.execute(
+        'SELECT name, file_path, kind, start_line, end_line FROM symbols WHERE codebase = ?',
+        (codebase_name,),
+    ).fetchall()
+
+    table: dict[str, list[dict]] = {}
+    for r in rows:
+        entry = {
+            'file_path': r['file_path'],
+            'kind': r['kind'],
+            'start_line': r['start_line'],
+            'end_line': r['end_line'],
+        }
+        table.setdefault(r['name'], []).append(entry)
+    return table
+
+
+def build_import_map(conn: sqlite3.Connection, codebase_name: str) -> dict[tuple[str, str], str]:
+    """Load import edges and build (file_path, imported_name) -> target_file mapping.
+
+    Only includes resolved imports (target_file IS NOT NULL).
+    """
+    rows = conn.execute(
+        "SELECT source_file, target_file, metadata FROM edges "
+        "WHERE codebase = ? AND edge_type IN ('import', 'static_import', 'wildcard_import') "
+        "AND target_file IS NOT NULL",
+        (codebase_name,),
+    ).fetchall()
+
+    imap: dict[tuple[str, str], str] = {}
+    for r in rows:
+        source = r['source_file']
+        target = r['target_file']
+        imported_name = r['metadata']  # metadata stores the import_name string
+        if imported_name:
+            # Store full import name
+            imap[(source, imported_name)] = target
+            # Also store just the last component (class/function name)
+            short_name = imported_name.rsplit('.', 1)[-1]
+            if short_name != '*':
+                imap[(source, short_name)] = target
+    return imap
+
+
+def index_call_graph(
+    conn: sqlite3.Connection,
+    name: str,
+    repo_path: Path,
+    incremental: bool = False,
+) -> dict:
+    """Extract call sites and resolve them to target symbols.
+
+    Orchestrates: extract call sites per file, run resolution cascade, store edges.
+    """
+    from ast_parser import extract_call_sites, extract_symbols
+    from call_resolver import resolve_call_targets
+
+    ensure_dep_tables(conn)
+
+    files = discover_files(repo_path)
+    dep_files = [f for f in files if f.suffix in DEP_EXTENSIONS]
+
+    if not dep_files:
+        return {'error': 'No parseable source files found'}
+
+    # Load existing hashes for incremental mode
+    existing_hashes: dict[str, str] = {}
+    if incremental:
+        rows = conn.execute(
+            'SELECT file_path, content_hash FROM codebase_meta WHERE codebase = ?',
+            (name,),
+        ).fetchall()
+        existing_hashes = {r['file_path']: r['content_hash'] for r in rows}
+
+    # Build symbol table and import map from DB
+    print('[calls] Building symbol table and import map...', file=sys.stderr)
+    symbol_table = build_symbol_table(conn, name)
+    import_map = build_import_map(conn, name)
+    print(f'[calls] {len(symbol_table)} symbols, {len(import_map)} import mappings', file=sys.stderr)
+
+    now_ts = int(time.time())
+    total_calls = 0
+    total_resolved = 0
+    total_unresolved = 0
+    total_files = 0
+    skipped = 0
+    t0 = time.time()
+
+    all_call_sites: list[dict] = []
+    lang_map = {'java': 'java', 'kt': 'kotlin', 'py': 'python'}
+
+    for i, fpath in enumerate(dep_files):
+        rel = str(fpath.relative_to(repo_path))
+
+        # Compute hash and skip unchanged in incremental mode
+        try:
+            fhash = file_hash(fpath)
+        except Exception:
+            continue
+
+        if incremental and existing_hashes.get(rel) == fhash:
+            skipped += 1
+            continue
+
+        lang = lang_map.get(fpath.suffix.lstrip('.'))
+        if not lang:
+            continue
+
+        # Delete old call edges for this file
+        conn.execute(
+            "DELETE FROM edges WHERE source_file = ? AND codebase = ? AND edge_type IN ('calls', 'calls_unresolved')",
+            (rel, name),
+        )
+
+        # Extract symbols for this file (for caller identification)
+        try:
+            syms = extract_symbols(str(fpath))
+        except Exception:
+            syms = []
+
+        # Read source and extract call sites
+        try:
+            source_code = fpath.read_bytes() if lang in ('java', 'kotlin') else fpath.read_text(errors='replace')
+            calls = extract_call_sites(str(fpath), source_code, lang, syms)
+        except Exception as e:
+            print(f'[calls] Extraction failed {rel}: {e}', file=sys.stderr)
+            calls = []
+
+        # Normalize file_path in call sites to relative path
+        for call in calls:
+            call['file_path'] = rel
+
+        all_call_sites.extend(calls)
+        total_files += 1
+
+        if total_files % 100 == 0:
+            elapsed = time.time() - t0
+            print(
+                f'\r[calls] {total_files}/{len(dep_files)} files, '
+                f'{len(all_call_sites)} call sites, {elapsed:.1f}s',
+                end='', file=sys.stderr,
+            )
+
+    # Run resolution cascade on all collected call sites
+    print(f'\n[calls] Resolving {len(all_call_sites)} call sites...', file=sys.stderr)
+    resolved_edges = resolve_call_targets(all_call_sites, symbol_table, import_map)
+
+    # Store edges
+    for edge in resolved_edges:
+        metadata_json = json.dumps(edge['metadata'])
+        conn.execute(
+            'INSERT INTO edges (codebase, source_file, target_file, edge_type, metadata, confidence, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (name, edge['source_file'], edge['target_file'], edge['edge_type'],
+             metadata_json, edge['confidence'], now_ts),
+        )
+        total_calls += 1
+        if edge['edge_type'] == 'calls':
+            total_resolved += 1
+        else:
+            total_unresolved += 1
+
+    conn.commit()
+    elapsed = time.time() - t0
+    print(f'[calls] Done: {total_files} files, {total_calls} call edges '
+          f'({total_resolved} resolved, {total_unresolved} unresolved), '
+          f'{skipped} skipped, {elapsed:.1f}s', file=sys.stderr)
+
+    return {
+        'files_processed': total_files,
+        'call_edges': total_calls,
+        'resolved': total_resolved,
+        'unresolved': total_unresolved,
+        'files_skipped': skipped,
+        'elapsed_seconds': round(elapsed, 1),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Index codebases for semantic search')
     parser.add_argument('--path', type=str, help='Path to repository root')
@@ -548,6 +737,7 @@ def main():
     parser.add_argument('--model', type=str, default=DEFAULT_MODEL, help='Embedding model name')
     parser.add_argument('--deps', action='store_true', help='Extract dependency graph (imports + symbols)')
     parser.add_argument('--deps-only', action='store_true', help='Only extract dependencies, skip chunk embedding')
+    parser.add_argument('--calls', action='store_true', help='Extract call graph (function-level call edges)')
 
     args = parser.parse_args()
 
@@ -594,6 +784,14 @@ def main():
             incremental=args.update,
         )
         print(f'\nDependency indexing result: {dep_result}')
+
+    # Call graph extraction pass (runs after deps since it needs symbols/imports)
+    if args.calls:
+        call_result = index_call_graph(
+            conn, args.name, repo_path,
+            incremental=args.update,
+        )
+        print(f'\nCall graph result: {call_result}')
 
     conn.close()
 
