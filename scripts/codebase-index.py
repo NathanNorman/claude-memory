@@ -76,6 +76,11 @@ def get_db() -> sqlite3.Connection:
             PRIMARY KEY (codebase, file_path)
         )
     ''')
+    # Add binary embedding column (nullable, metadata-only in SQLite)
+    try:
+        conn.execute('ALTER TABLE chunks ADD COLUMN embedding_binary BLOB')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -143,7 +148,7 @@ def embed_and_store_batch(
     if not chunks:
         return 0
 
-    from quantize import quantize as quant_fn
+    from quantize import quantize as quant_fn, quantize_binary
 
     texts = [c['content'] for c in chunks]
     embeddings = model.encode(texts, normalize_embeddings=True, batch_size=batch_size)
@@ -154,6 +159,10 @@ def embed_and_store_batch(
         c_hash = content_hash(chunk['content'])
 
         emb_arr = np.array(emb, dtype=np.float32)
+
+        # Binary embedding from unrotated normalized vector
+        binary_blob = bytes(quantize_binary(emb_arr.reshape(1, -1))[0])
+
         if rotate_fn is not None and codebook is not None:
             blob = quant_fn(emb_arr, rotate_fn, codebook)
         else:
@@ -163,13 +172,13 @@ def embed_and_store_batch(
         conn.execute(
             'INSERT OR REPLACE INTO chunks '
             '(id, file_path, chunk_index, start_line, end_line, '
-            'title, content, embedding, hash, updated_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'title, content, embedding, embedding_binary, hash, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 chunk_id, chunk['file_path'], chunk['chunk_index'],
                 chunk['start_line'], chunk['end_line'],
                 chunk['title'], chunk['content'],
-                blob, c_hash, int(datetime.now().timestamp() * 1000),
+                blob, binary_blob, c_hash, int(datetime.now().timestamp() * 1000),
             ),
         )
 

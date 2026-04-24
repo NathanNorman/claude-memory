@@ -605,6 +605,9 @@ class VectorSearchBackend:
         self._rotate_fn = None
         self._inv_rotate_fn = None
         self._codebook = None
+        # Binary (1-bit) quantization state for Hamming coarse pass
+        self._binary_matrix = None   # numpy uint8 array (N, packed_dims)
+        self._binary_available = False
 
     def _ensure_conn(self) -> Optional[sqlite3.Connection]:
         if self._conn is not None:
@@ -637,6 +640,11 @@ class VectorSearchBackend:
                 UNIQUE(model_name, dims, bit_width)
             )
         ''')
+        # Add binary embedding column (nullable, metadata-only in SQLite)
+        try:
+            conn.execute('ALTER TABLE chunks ADD COLUMN embedding_binary BLOB')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     def _load_quantization_params(self, conn: sqlite3.Connection) -> bool:
         """Load rotation + codebook from quantization_meta if available."""
@@ -725,15 +733,18 @@ class VectorSearchBackend:
             quant_size = packed_size(self.EMBEDDING_DIMS, self.DEFAULT_BIT_WIDTH) if has_quant else 0
 
             rows = conn.execute(
-                'SELECT rowid, embedding FROM chunks '
+                'SELECT rowid, embedding, embedding_binary FROM chunks '
                 'WHERE embedding IS NOT NULL'
             ).fetchall()
 
             valid_rowids = []
             valid_embeddings = []  # Only used for float32 (legacy)
             packed_list = [] if has_quant else None
+            binary_blobs = []     # Collected binary embeddings
             n_float32 = 0
             n_quantized = 0
+            n_binary = 0
+            n_missing_binary = 0
 
             for row in rows:
                 blob = row['embedding']
@@ -763,6 +774,14 @@ class VectorSearchBackend:
                     packed_list.append(blob)
                     n_quantized += 1
 
+                # Track binary embedding
+                bin_blob = row['embedding_binary']
+                if bin_blob:
+                    binary_blobs.append(np.frombuffer(bin_blob, dtype=np.uint8))
+                    n_binary += 1
+                else:
+                    n_missing_binary += 1
+
             if not valid_rowids:
                 log.warning('Vector backend: no valid embeddings found')
                 return False
@@ -774,6 +793,23 @@ class VectorSearchBackend:
             if has_quant and packed_list:
                 self._packed_list = packed_list
                 self._quantized = True
+
+            # Build binary matrix only if every vector has a binary embedding
+            if n_binary > 0 and n_missing_binary == 0:
+                self._binary_matrix = np.array(binary_blobs, dtype=np.uint8)
+                self._binary_available = True
+                log.info(
+                    f'Binary matrix loaded: {n_binary} vectors, '
+                    f'{self._binary_matrix.shape[1]} packed bytes each'
+                )
+            else:
+                self._binary_matrix = None
+                self._binary_available = False
+                if n_binary > 0:
+                    log.info(
+                        f'Binary matrix skipped: incomplete coverage '
+                        f'({n_binary} present, {n_missing_binary} missing)'
+                    )
 
             mode = 'quantized' if self._quantized else 'float32'
             log.info(
@@ -809,12 +845,18 @@ class VectorSearchBackend:
             self._init_failed = True
             return None
 
-    def search(self, query: str, limit: int) -> list[dict]:
-        """Vector similarity search with optional quantized acceleration.
+    # Candidate counts for three-stage pipeline
+    BINARY_TOP_K = 1000   # Stage 1: binary Hamming → top candidates
+    TURBOQUANT_TOP_K = 50  # Stage 2: TurboQuant → top candidates
 
-        If quantized index is available: two-stage search
-          1. Approximate shortlist via quantized dot products
-          2. Exact reranking from float32 matrix
+    def search(self, query: str, limit: int) -> list[dict]:
+        """Vector similarity search with optional three-stage acceleration.
+
+        If binary + quantized index available: three-stage search
+          1. Binary Hamming distance over all vectors → top 1000
+          2. TurboQuant 4-bit dot products on 1000 → top 50
+          3. Exact float32 reranking on 50 → top k
+        If only quantized index available: two-stage search (TurboQuant + exact)
         Otherwise: brute-force cosine similarity (legacy path).
         """
         if self._init_failed or limit <= 0:
@@ -834,8 +876,51 @@ class VectorSearchBackend:
         query_vec = model.encode(query, normalize_embeddings=True)
         query_vec = np.array(query_vec, dtype=np.float32).flatten()
 
-        if self._quantized and self._packed_list:
-            # Two-stage quantized search with on-demand reranking
+        if self._binary_available and self._quantized and self._packed_list:
+            # Three-stage pipeline: binary → TurboQuant → float32
+            from quantize import dequantize, quantize_binary, hamming_distance
+
+            # Stage 1: Binary Hamming coarse pass
+            binary_query = quantize_binary(query_vec)
+            distances = hamming_distance(binary_query, self._binary_matrix)
+            stage1_k = min(self.BINARY_TOP_K, len(distances))
+            # argpartition for top-k smallest distances
+            if stage1_k < len(distances):
+                stage1_indices = np.argpartition(distances, stage1_k)[:stage1_k]
+            else:
+                stage1_indices = np.arange(len(distances))
+
+            # Stage 2: TurboQuant dot products on Stage 1 candidates
+            query_rotated = self._rotate_fn(query_vec)
+            stage1_packed = [self._packed_list[i] for i in stage1_indices]
+            approx_sims = batch_quantized_dot_products(
+                query_rotated, stage1_packed, self._codebook,
+                self.EMBEDDING_DIMS,
+            )
+            stage2_k = min(self.TURBOQUANT_TOP_K, len(approx_sims))
+            stage2_local = np.argsort(approx_sims)[-stage2_k:]
+            stage2_indices = stage1_indices[stage2_local]
+
+            # Stage 3: Exact float32 reranking via dequantization
+            candidate_vecs = []
+            for ci in stage2_indices:
+                deq = dequantize(
+                    self._packed_list[ci], self._inv_rotate_fn,
+                    self._codebook, self.EMBEDDING_DIMS,
+                )
+                norm = np.linalg.norm(deq)
+                if norm > 0:
+                    deq = deq / norm
+                candidate_vecs.append(deq)
+            candidate_matrix = np.array(candidate_vecs, dtype=np.float32)
+
+            exact_sims = candidate_matrix @ query_vec
+            top_within = np.argsort(exact_sims)[-limit:][::-1]
+            top_indices = [stage2_indices[j] for j in top_within]
+            similarities = np.array([exact_sims[j] for j in top_within])
+
+        elif self._quantized and self._packed_list:
+            # Two-stage quantized search (fallback when binary not available)
             from quantize import dequantize
 
             query_rotated = self._rotate_fn(query_vec)
@@ -940,6 +1025,10 @@ class VectorSearchBackend:
             import numpy as np
             emb_arr = np.array(emb, dtype=np.float32)
 
+            # Binary embedding from unrotated normalized vector
+            from quantize import quantize_binary
+            binary_blob = bytes(quantize_binary(emb_arr.reshape(1, -1))[0])
+
             if has_quant:
                 from quantize import quantize as quant_fn
                 blob = quant_fn(emb_arr, self._rotate_fn, self._codebook)
@@ -947,8 +1036,8 @@ class VectorSearchBackend:
                 blob = struct.pack(f'{self.EMBEDDING_DIMS}f', *emb_arr.tolist())
 
             conn.execute(
-                'UPDATE chunks SET embedding = ? WHERE rowid = ?',
-                (blob, row['rowid']),
+                'UPDATE chunks SET embedding = ?, embedding_binary = ? WHERE rowid = ?',
+                (blob, binary_blob, row['rowid']),
             )
             count += 1
 
@@ -967,6 +1056,8 @@ class VectorSearchBackend:
         self._rowids = None
         self._packed_list = None
         self._quantized = False
+        self._binary_matrix = None
+        self._binary_available = False
 
     def get_stats(self) -> dict:
         """Get vector index statistics."""
@@ -993,6 +1084,16 @@ class VectorSearchBackend:
             if qrow:
                 result['quantized'] = True
                 result['bit_width'] = qrow['bit_width']
+            # Binary vector stats
+            result['binary_available'] = self._binary_available
+            try:
+                brow = conn.execute(
+                    'SELECT count(*) as cnt FROM chunks '
+                    'WHERE embedding_binary IS NOT NULL'
+                ).fetchone()
+                result['binary_vectors'] = brow['cnt']
+            except Exception:
+                result['binary_vectors'] = 0
             return result
         except Exception as e:
             return {'status': 'error', 'error': str(e)}
