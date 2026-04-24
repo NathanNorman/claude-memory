@@ -37,14 +37,19 @@ SOURCE_EXTENSIONS = {
     '.py', '.java', '.kt', '.scala', '.sh', '.sql', '.js', '.ts', '.tf', '.md',
 }
 
-# Model config (matches unified_memory_server.py defaults)
-DEFAULT_MODEL = os.environ.get('MEMORY_EMBEDDING_MODEL', 'bge-base-en-v1.5')
+# Model config — dual-model architecture
+# CodeRankEmbed for codebase (code-specialized), bge-base for memory (natural language)
+CODEBASE_EMBEDDING_MODEL = 'nomic-ai/CodeRankEmbed'
+CODEBASE_QUERY_PREFIX = 'Represent this query for searching relevant code: '
+MEMORY_EMBEDDING_MODEL = 'BAAI/bge-base-en-v1.5'
+DEFAULT_MODEL = os.environ.get('MEMORY_CODEBASE_MODEL', CODEBASE_EMBEDDING_MODEL)
 MODEL_DIMS = {
     'all-MiniLM-L6-v2': 384,
     'bge-small-en-v1.5': 384,
     'bge-base-en-v1.5': 768,
     'all-mpnet-base-v2': 768,
     'bge-large-en-v1.5': 1024,
+    'nomic-ai/CodeRankEmbed': 768,
 }
 MODEL_PREFIXES = {
     'bge-base-en-v1.5': 'BAAI/bge-base-en-v1.5',
@@ -111,6 +116,71 @@ def load_quantization_params(conn: sqlite3.Connection, model_name: str, dims: in
         return None, None
 
 
+def build_structural_prefix(file_path: str, title: str) -> str:
+    """Construct structural context prefix for embedding input.
+
+    Format: "{rel_path} | {title}\n"
+    The file_path is expected to be like "codebase:name/rel/path.py" —
+    we strip the "codebase:name/" prefix to get the relative path.
+    """
+    # Strip "codebase:<name>/" prefix to get relative path
+    if '/' in file_path:
+        rel_path = file_path.split('/', 1)[1] if ':' in file_path else file_path
+    else:
+        rel_path = file_path
+    return f'{rel_path} | {title}\n'
+
+
+def check_codebase_model(conn: sqlite3.Connection, model_name: str) -> bool:
+    """Check if codebase model matches meta table. Returns True if reindex needed."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'codebase_embedding_model'"
+        ).fetchone()
+        if row:
+            stored_model = row['value']
+            if stored_model != model_name:
+                print(
+                    f'[codebase-index] Model changed: {stored_model} -> {model_name}. '
+                    f'Full reindex required.',
+                    file=sys.stderr,
+                )
+                return True
+        return False
+    except Exception:
+        # meta table may not exist yet
+        return False
+
+
+def purge_all_codebase_chunks(conn: sqlite3.Connection) -> None:
+    """Purge all codebase chunks and metadata for a fresh reindex."""
+    print('[codebase-index] Purging all codebase chunks for model migration...', file=sys.stderr)
+    # Delete FTS entries for codebase chunks
+    try:
+        conn.execute(
+            "DELETE FROM chunks_fts WHERE rowid IN "
+            "(SELECT rowid FROM chunks WHERE file_path LIKE 'codebase:%')"
+        )
+    except Exception:
+        pass
+    conn.execute("DELETE FROM chunks WHERE file_path LIKE 'codebase:%'")
+    conn.execute('DELETE FROM codebase_meta')
+    conn.commit()
+    print('[codebase-index] Purge complete.', file=sys.stderr)
+
+
+def write_codebase_model_meta(conn: sqlite3.Connection, model_name: str) -> None:
+    """Write the codebase embedding model name to the meta table."""
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('codebase_embedding_model', ?)",
+            (model_name,),
+        )
+        conn.commit()
+    except Exception as e:
+        print(f'[codebase-index] Warning: could not write codebase model meta: {e}', file=sys.stderr)
+
+
 def discover_files(repo_path: Path) -> list[Path]:
     """Use git ls-files to discover source files, respecting .gitignore."""
     result = subprocess.run(
@@ -145,7 +215,11 @@ def embed_and_store_batch(
 
     from quantize import quantize as quant_fn
 
-    texts = [c['content'] for c in chunks]
+    # Prepend structural context prefix for embedding input only (not stored content)
+    texts = []
+    for c in chunks:
+        prefix = build_structural_prefix(c['file_path'], c['title'])
+        texts.append(prefix + c['content'])
     embeddings = model.encode(texts, normalize_embeddings=True, batch_size=batch_size)
 
     count = 0
@@ -576,7 +650,15 @@ def main():
     # Chunk embedding pass (skip if --deps-only)
     if not args.deps_only:
         model_name = args.model
-        dims = MODEL_DIMS.get(model_name, 384)
+        dims = MODEL_DIMS.get(model_name, 768)
+
+        # Check if model changed — if so, purge all codebase chunks and force full reindex
+        needs_reindex = check_codebase_model(conn, model_name)
+        if needs_reindex:
+            purge_all_codebase_chunks(conn)
+            # Force full reindex (disable incremental)
+            args.update = False
+
         rotate_fn, codebook = load_quantization_params(conn, model_name, dims)
         model = load_model(model_name)
 
@@ -586,6 +668,9 @@ def main():
             incremental=args.update,
         )
         print(f'\nChunk indexing result: {result}')
+
+        # Record codebase embedding model in meta table
+        write_codebase_model_meta(conn, model_name)
 
     # Dependency extraction pass
     if args.deps or args.deps_only:
