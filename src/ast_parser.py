@@ -594,6 +594,198 @@ def _python_base_name(node) -> str | None:
 
 
 # ──────────────────────────────────────────────────────────────
+# TypeScript/JavaScript imports & symbols
+# ──────────────────────────────────────────────────────────────
+
+_TS_EXTENSIONS = {'.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'}
+_TSX_EXTENSIONS = {'.tsx', '.jsx'}
+
+
+def _ts_grammar_for_ext(file_path: str) -> str:
+    """Return the tree-sitter grammar name for a TypeScript/JavaScript file."""
+    ext = Path(file_path).suffix.lower()
+    return 'tsx' if ext in _TSX_EXTENSIONS else 'typescript'
+
+
+def _has_ts_extension(file_path: str) -> bool:
+    """Check if file has a TypeScript/JavaScript extension."""
+    return any(file_path.endswith(ext) for ext in _TS_EXTENSIONS)
+
+
+def extract_typescript_imports(file_path: str) -> list[dict]:
+    """Extract imports from a TypeScript/JavaScript file using tree-sitter."""
+    try:
+        source = Path(file_path).read_bytes()
+        grammar = _ts_grammar_for_ext(file_path)
+        parser = _get_parser(grammar)
+        tree = parser.parse(source)
+    except Exception:
+        return []
+
+    imports = []
+    for node in tree.root_node.children:
+        if node.type == 'import_statement':
+            _parse_ts_import_statement(node, imports)
+        elif node.type == 'export_statement':
+            _parse_ts_export_reexport(node, imports)
+        elif node.type == 'expression_statement':
+            _parse_ts_require_expression(node, imports)
+        elif node.type == 'lexical_declaration':
+            _parse_ts_require_declaration(node, imports)
+    return imports
+
+
+def _get_string_value(node) -> str | None:
+    """Extract string value from a tree-sitter string node, stripping quotes."""
+    if node is None:
+        return None
+    text = node.text.decode()
+    if len(text) >= 2 and text[0] in ('"', "'", '`'):
+        return text[1:-1]
+    return text
+
+
+def _find_child_by_type(node, type_name: str):
+    """Find the first child node of a given type."""
+    for child in node.children:
+        if child.type == type_name:
+            return child
+    return None
+
+
+def _parse_ts_import_statement(node, imports: list[dict]):
+    """Parse an import_statement node into import records."""
+    source_node = _find_child_by_type(node, 'string')
+    if source_node is None:
+        return
+    source_module = _get_string_value(source_node)
+    if source_module is None:
+        return
+
+    import_clause = _find_child_by_type(node, 'import_clause')
+    if import_clause is None:
+        imports.append({'import_string': '', 'import_type': 'side_effect', 'source_module': source_module})
+        return
+
+    for child in import_clause.children:
+        if child.type == 'identifier':
+            imports.append({'import_string': child.text.decode(), 'import_type': 'default_import', 'source_module': source_module})
+        elif child.type == 'namespace_import':
+            imports.append({'import_string': child.text.decode(), 'import_type': 'namespace_import', 'source_module': source_module})
+        elif child.type == 'named_imports':
+            names = [spec.text.decode() for spec in child.children if spec.type == 'import_specifier']
+            imports.append({'import_string': ', '.join(names), 'import_type': 'import', 'source_module': source_module})
+
+
+def _parse_ts_export_reexport(node, imports: list[dict]):
+    """Parse re-export statements: export { Foo } from './module'."""
+    source_node = _find_child_by_type(node, 'string')
+    if source_node is None:
+        return
+    source_module = _get_string_value(source_node)
+    if source_module is None:
+        return
+    export_clause = _find_child_by_type(node, 'export_clause')
+    names = []
+    if export_clause:
+        names = [spec.text.decode() for spec in export_clause.children if spec.type == 'export_specifier']
+    has_star = any(c.type == '*' or c.text.decode() == '*' for c in node.children
+                   if c.type not in ('string', 'export_clause', 'comment'))
+    imports.append({'import_string': '* ' if has_star else ', '.join(names), 'import_type': 'reexport', 'source_module': source_module})
+
+
+def _parse_ts_require_expression(node, imports: list[dict]):
+    """Parse top-level require() expression statements."""
+    for child in node.children:
+        if child.type == 'call_expression':
+            _extract_require_call(child, imports)
+
+
+def _parse_ts_require_declaration(node, imports: list[dict]):
+    """Parse const/let x = require('module') declarations."""
+    for decl in node.children:
+        if decl.type == 'variable_declarator':
+            value_node = _find_child_by_type(decl, 'call_expression')
+            if value_node:
+                _extract_require_call(value_node, imports)
+
+
+def _extract_require_call(call_node, imports: list[dict]):
+    """Extract a require() call into an import record."""
+    fn_node = _find_child_by_type(call_node, 'identifier')
+    if fn_node is None or fn_node.text.decode() != 'require':
+        return
+    args_node = _find_child_by_type(call_node, 'arguments')
+    if args_node is None:
+        return
+    string_node = _find_child_by_type(args_node, 'string')
+    if string_node is None:
+        return
+    source_module = _get_string_value(string_node)
+    if source_module:
+        imports.append({'import_string': source_module, 'import_type': 'require', 'source_module': source_module})
+
+
+def extract_typescript_symbols(file_path: str) -> list[dict]:
+    """Extract symbol declarations from a TypeScript/JavaScript file using tree-sitter."""
+    try:
+        source = Path(file_path).read_bytes()
+        grammar = _ts_grammar_for_ext(file_path)
+        parser = _get_parser(grammar)
+        tree = parser.parse(source)
+    except Exception:
+        return []
+    symbols = []
+    _walk_typescript_symbols(tree.root_node, symbols, exported=False, class_name=None)
+    return symbols
+
+
+def _walk_typescript_symbols(node, symbols: list[dict], exported: bool, class_name: str | None):
+    """Recursively walk TypeScript AST to extract symbol declarations."""
+    _DECL_KINDS = {
+        'class_declaration': 'class', 'abstract_class_declaration': 'class',
+        'interface_declaration': 'interface', 'function_declaration': 'function',
+        'enum_declaration': 'enum', 'type_alias_declaration': 'type_alias',
+    }
+
+    if node.type == 'export_statement':
+        for child in node.children:
+            _walk_typescript_symbols(child, symbols, exported=True, class_name=class_name)
+        return
+
+    if node.type in _DECL_KINDS:
+        kind = _DECL_KINDS[node.type]
+        name_node = _find_child_by_type(node, 'type_identifier') or _find_child_by_type(node, 'identifier')
+        if name_node:
+            name = name_node.text.decode()
+            symbols.append({'name': name, 'kind': kind, 'start_line': node.start_point[0] + 1, 'end_line': node.end_point[0] + 1, 'exported': exported})
+            if kind in ('class', 'interface'):
+                body = _find_child_by_type(node, 'class_body')
+                if body:
+                    for child in body.children:
+                        _walk_typescript_symbols(child, symbols, exported=False, class_name=name)
+        return
+
+    if node.type == 'lexical_declaration' and class_name is None:
+        for child in node.children:
+            if child.type == 'variable_declarator':
+                name_node = _find_child_by_type(child, 'identifier')
+                value_node = _find_child_by_type(child, 'arrow_function') or _find_child_by_type(child, 'function')
+                if name_node and value_node:
+                    symbols.append({'name': name_node.text.decode(), 'kind': 'function', 'start_line': node.start_point[0] + 1, 'end_line': node.end_point[0] + 1, 'exported': exported})
+        return
+
+    if node.type == 'method_definition' and class_name is not None:
+        name_node = _find_child_by_type(node, 'property_identifier')
+        if name_node:
+            symbols.append({'name': f'{class_name}.{name_node.text.decode()}', 'kind': 'method', 'start_line': node.start_point[0] + 1, 'end_line': node.end_point[0] + 1, 'exported': False})
+        return
+
+    for child in node.children:
+        _walk_typescript_symbols(child, symbols, exported=exported, class_name=class_name)
+
+
+# ──────────────────────────────────────────────────────────────
 # TypeScript hierarchy extraction
 # ──────────────────────────────────────────────────────────────
 
@@ -687,6 +879,8 @@ def extract_imports(file_path: str) -> list[dict]:
         return extract_kotlin_imports(file_path)
     elif file_path.endswith('.py'):
         return extract_python_imports(file_path)
+    elif _has_ts_extension(file_path):
+        return extract_typescript_imports(file_path)
     return []
 
 
@@ -698,6 +892,8 @@ def extract_symbols(file_path: str) -> list[dict]:
         return extract_kotlin_symbols(file_path)
     elif file_path.endswith('.py'):
         return extract_python_symbols(file_path)
+    elif _has_ts_extension(file_path):
+        return extract_typescript_symbols(file_path)
     return []
 
 

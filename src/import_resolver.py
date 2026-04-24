@@ -1,10 +1,11 @@
 """
 Import resolver: maps import strings to file paths within a repository.
 
-Handles Java, Kotlin, and Python import resolution for monorepo layouts
-where source roots appear at multiple levels (e.g., subproject/src/main/java/).
+Handles Java, Kotlin, Python, and TypeScript/JavaScript import resolution
+for monorepo layouts where source roots appear at multiple levels.
 """
 
+import json
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -18,7 +19,7 @@ def _find_source_roots(repo_path: str) -> dict[str, list[Path]]:
     Cached per repo_path.
     """
     repo = Path(repo_path)
-    roots: dict[str, list[Path]] = {'java': [], 'kotlin': [], 'python': []}
+    roots: dict[str, list[Path]] = {'java': [], 'kotlin': [], 'python': [], 'typescript': []}
 
     for dirpath, dirnames, _ in os.walk(str(repo)):
         p = Path(dirpath)
@@ -41,6 +42,13 @@ def _find_source_roots(repo_path: str) -> dict[str, list[Path]]:
     src = repo / 'src'
     if src.is_dir():
         roots['python'].append(src)
+
+    # TypeScript: look for package.json, src/ dirs
+    if (repo / 'package.json').exists():
+        roots['typescript'].append(repo)
+    ts_src = repo / 'src'
+    if ts_src.is_dir() and ts_src not in roots['typescript']:
+        roots['typescript'].append(ts_src)
 
     return roots
 
@@ -129,15 +137,142 @@ def resolve_python_import(import_name: str, repo_path: str) -> str | None:
     return None
 
 
+# ──────────────────────────────────────────────────────────────
+# TypeScript/JavaScript import resolution
+# ──────────────────────────────────────────────────────────────
+
+# Extensions to probe when resolving TS/JS imports
+_TS_PROBE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx']
+_TS_INDEX_FILES = ['index.ts', 'index.tsx', 'index.js', 'index.jsx']
+
+
+@lru_cache(maxsize=32)
+def _read_tsconfig_paths(repo_path: str) -> tuple[str, dict[str, list[str]]]:
+    """Read compilerOptions.paths and baseUrl from tsconfig.json at repo root.
+
+    Returns (baseUrl, paths_dict). Both default to empty if tsconfig is absent
+    or doesn't contain these fields.
+    """
+    tsconfig_path = Path(repo_path) / 'tsconfig.json'
+    if not tsconfig_path.exists():
+        return ('', {})
+
+    try:
+        text = tsconfig_path.read_text(errors='replace')
+        config = json.loads(text)
+        compiler_opts = config.get('compilerOptions', {})
+        base_url = compiler_opts.get('baseUrl', '')
+        paths = compiler_opts.get('paths', {})
+        return (base_url, paths)
+    except Exception:
+        return ('', {})
+
+
+def _probe_ts_file(base: Path) -> Path | None:
+    """Try to resolve a base path to an actual TS/JS file.
+
+    Tries: base.ts, base.tsx, base.js, base.jsx, base/index.ts, etc.
+    Also returns base directly if it already has a recognized extension and exists.
+    """
+    # If the path already has an extension and exists
+    if base.suffix in ('.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs') and base.exists():
+        return base
+
+    # Try adding extensions
+    for ext in _TS_PROBE_EXTENSIONS:
+        candidate = base.parent / (base.name + ext)
+        if candidate.exists():
+            return candidate
+
+    # Try as directory with index file
+    if base.is_dir():
+        for idx in _TS_INDEX_FILES:
+            candidate = base / idx
+            if candidate.exists():
+                return candidate
+
+    return None
+
+
+def resolve_typescript_import(
+    import_name: str,
+    repo_path: str,
+    source_file: str | None = None,
+) -> str | None:
+    """Resolve a TypeScript/JavaScript import to a file path relative to repo root.
+
+    Handles:
+    - Relative imports (./foo, ../bar) with extension probing
+    - Path aliases from tsconfig.json (e.g., @/* -> src/*)
+    - Falls back to @/ -> src/ convention if no tsconfig
+    - Bare specifiers (react, lodash) return None (external)
+    """
+    repo = Path(repo_path)
+
+    # Relative imports
+    if import_name.startswith('./') or import_name.startswith('../'):
+        if source_file:
+            source_dir = (repo / source_file).parent
+        else:
+            source_dir = repo
+        target_base = (source_dir / import_name).resolve()
+        resolved = _probe_ts_file(target_base)
+        if resolved and str(resolved).startswith(str(repo)):
+            return str(resolved.relative_to(repo))
+        return None
+
+    # Path alias resolution
+    base_url, paths = _read_tsconfig_paths(repo_path)
+    base_dir = repo / base_url if base_url else repo
+
+    # Check configured path aliases
+    for pattern, targets in paths.items():
+        if pattern.endswith('/*'):
+            prefix = pattern[:-2]  # e.g., '@' from '@/*'
+            if import_name.startswith(prefix + '/'):
+                suffix = import_name[len(prefix) + 1:]
+                for target_pattern in targets:
+                    if target_pattern.endswith('/*'):
+                        target_dir = target_pattern[:-2]  # e.g., 'src' from 'src/*'
+                        target_base = (base_dir / target_dir / suffix).resolve()
+                        resolved = _probe_ts_file(target_base)
+                        if resolved and str(resolved).startswith(str(repo)):
+                            return str(resolved.relative_to(repo))
+                return None
+        elif pattern == import_name:
+            # Exact match alias
+            for target in targets:
+                target_base = (base_dir / target).resolve()
+                resolved = _probe_ts_file(target_base)
+                if resolved and str(resolved).startswith(str(repo)):
+                    return str(resolved.relative_to(repo))
+            return None
+
+    # Fallback: @/ -> src/ convention (when no tsconfig paths matched)
+    if import_name.startswith('@/'):
+        suffix = import_name[2:]
+        target_base = (repo / 'src' / suffix).resolve()
+        resolved = _probe_ts_file(target_base)
+        if resolved and str(resolved).startswith(str(repo)):
+            return str(resolved.relative_to(repo))
+        return None
+
+    # Bare specifier (npm package) -- not resolvable within repo
+    return None
+
+
 def resolve_import(import_name: str, repo_path: str, language: str) -> str | None:
     """Resolve an import string to a file path, dispatching by language."""
     if language in ('java', 'kotlin'):
         return resolve_java_import(import_name, repo_path)
     elif language == 'python':
         return resolve_python_import(import_name, repo_path)
+    elif language == 'typescript':
+        return resolve_typescript_import(import_name, repo_path)
     return None
 
 
 def clear_cache():
     """Clear the source roots cache (call after repo changes)."""
     _find_source_roots.cache_clear()
+    _read_tsconfig_paths.cache_clear()
