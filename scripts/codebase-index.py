@@ -39,11 +39,15 @@ SOURCE_EXTENSIONS = {
 }
 
 # Model config — dual-model architecture
-# CodeRankEmbed for codebase (code-specialized), bge-base for memory (natural language)
-CODEBASE_EMBEDDING_MODEL = 'nomic-ai/CodeRankEmbed'
-CODEBASE_QUERY_PREFIX = 'Represent this query for searching relevant code: '
+# nomic-embed-text-v1.5 for codebase (MRL-capable, Matryoshka), bge-base for memory
+CODEBASE_EMBEDDING_MODEL = 'nomic-ai/nomic-embed-text-v1.5'
+CODEBASE_DOC_PREFIX = 'search_document: '
+CODEBASE_QUERY_PREFIX = 'search_query: '
 MEMORY_EMBEDDING_MODEL = 'BAAI/bge-base-en-v1.5'
 DEFAULT_MODEL = os.environ.get('MEMORY_CODEBASE_MODEL', CODEBASE_EMBEDDING_MODEL)
+# Valid Matryoshka dimensions for nomic-embed-text-v1.5
+MATRYOSHKA_DIMS = {64, 128, 256, 384, 512, 768}
+DEFAULT_TRUNCATE_DIMS = 256
 MODEL_DIMS = {
     'all-MiniLM-L6-v2': 384,
     'bge-small-en-v1.5': 384,
@@ -51,6 +55,7 @@ MODEL_DIMS = {
     'all-mpnet-base-v2': 768,
     'bge-large-en-v1.5': 1024,
     'nomic-ai/CodeRankEmbed': 768,
+    'nomic-ai/nomic-embed-text-v1.5': 768,
 }
 MODEL_PREFIXES = {
     'bge-base-en-v1.5': 'BAAI/bge-base-en-v1.5',
@@ -214,8 +219,16 @@ def embed_and_store_batch(
     rotate_fn,
     codebook,
     batch_size: int = 32,
+    truncate_dims: int = 0,
+    doc_prefix: str = '',
 ) -> int:
-    """Embed a batch of chunks and store in the database."""
+    """Embed a batch of chunks and store in the database.
+
+    Args:
+        truncate_dims: If > 0, truncate embeddings to this dimension and L2-renormalize
+                       (Matryoshka Representation Learning).
+        doc_prefix: Prefix to prepend to document text for asymmetric embedding models.
+    """
     if not chunks:
         return 0
 
@@ -225,7 +238,10 @@ def embed_and_store_batch(
     texts = []
     for c in chunks:
         prefix = build_structural_prefix(c['file_path'], c['title'])
-        texts.append(prefix + c['content'])
+        text = prefix + c['content']
+        if doc_prefix:
+            text = doc_prefix + text
+        texts.append(text)
     embeddings = model.encode(texts, normalize_embeddings=True, batch_size=batch_size)
 
     count = 0
@@ -234,6 +250,13 @@ def embed_and_store_batch(
         c_hash = content_hash(chunk['content'])
 
         emb_arr = np.array(emb, dtype=np.float32)
+
+        # Matryoshka truncation: truncate to target dims and L2-renormalize
+        if truncate_dims > 0 and len(emb_arr) > truncate_dims:
+            emb_arr = emb_arr[:truncate_dims]
+            norm = np.linalg.norm(emb_arr)
+            if norm > 0:
+                emb_arr = emb_arr / norm
 
         # Binary embedding from unrotated normalized vector
         binary_blob = bytes(quantize_binary(emb_arr.reshape(1, -1))[0])
@@ -287,6 +310,8 @@ def index_codebase(
     name: str,
     repo_path: Path,
     incremental: bool = False,
+    truncate_dims: int = 0,
+    doc_prefix: str = '',
 ) -> dict:
     """Index a codebase into the chunks table."""
     from code_chunker import chunk_file
@@ -372,7 +397,7 @@ def index_codebase(
 
         # Embed in batches
         if len(batch) >= batch_size:
-            stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
+            stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook, truncate_dims=truncate_dims, doc_prefix=doc_prefix)
             total_chunks += stored
             conn.commit()
             batch = []
@@ -385,7 +410,8 @@ def index_codebase(
 
     # Flush remaining batch
     if batch:
-        stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
+        stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook,
+                                       truncate_dims=truncate_dims, doc_prefix=doc_prefix)
         total_chunks += stored
 
     # Remove chunks for deleted files (incremental mode)
@@ -958,6 +984,8 @@ def main():
                         help='Run Louvain community detection on the dependency graph')
     parser.add_argument('--scip', action='store_true',
                         help='Run SCIP indexers as optional Tier 2 pass (requires working build)')
+    parser.add_argument('--dims', type=int, default=0,
+                        help='Matryoshka truncation dimension (64/128/256/384/512/768, default: 256 for nomic model, 0=full for others)')
 
     args = parser.parse_args()
 
@@ -1004,6 +1032,19 @@ def main():
         model_name = args.model
         dims = MODEL_DIMS.get(model_name, 768)
 
+        # Determine truncation dimension
+        truncate_dims = args.dims
+        doc_prefix = ''
+        if model_name == 'nomic-ai/nomic-embed-text-v1.5':
+            if truncate_dims == 0:
+                truncate_dims = DEFAULT_TRUNCATE_DIMS
+            if truncate_dims not in MATRYOSHKA_DIMS:
+                print(f'Error: --dims must be one of {sorted(MATRYOSHKA_DIMS)}', file=sys.stderr)
+                sys.exit(1)
+            doc_prefix = CODEBASE_DOC_PREFIX
+            print(f'[codebase-index] Matryoshka: {dims}d -> {truncate_dims}d '
+                  f'({dims / truncate_dims:.1f}x storage reduction)', file=sys.stderr)
+
         # Check if model changed — if so, purge all codebase chunks and force full reindex
         needs_reindex = check_codebase_model(conn, model_name)
         if needs_reindex:
@@ -1018,11 +1059,26 @@ def main():
             conn, model, rotate_fn, codebook,
             args.name, repo_path,
             incremental=args.update,
+            truncate_dims=truncate_dims,
+            doc_prefix=doc_prefix,
         )
         print(f'\nChunk indexing result: {result}')
 
-        # Record codebase embedding model in meta table
+        # Report storage reduction for Matryoshka
+        if truncate_dims > 0 and truncate_dims < dims:
+            print(f'Embedding storage: {dims / truncate_dims:.1f}x reduction '
+                  f'({dims}d -> {truncate_dims}d)', file=sys.stderr)
+
+        # Record codebase embedding model and dims in meta table
         write_codebase_model_meta(conn, model_name)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('codebase_embedding_dims', ?)",
+                (str(truncate_dims if truncate_dims > 0 else dims),),
+            )
+            conn.commit()
+        except Exception as e:
+            print(f'[codebase-index] Warning: could not write dims meta: {e}', file=sys.stderr)
 
     # Dependency extraction pass
     if args.deps or args.deps_only:

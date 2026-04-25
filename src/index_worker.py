@@ -45,8 +45,8 @@ SOURCE_EXTENSIONS = {
 # Null SHA indicating a new branch
 NULL_SHA = '0' * 40
 
-# Model config (matches codebase-index.py — CodeRankEmbed for codebase chunks)
-CODEBASE_EMBEDDING_MODEL = 'nomic-ai/CodeRankEmbed'
+# Model config (matches codebase-index.py — nomic-embed-text-v1.5 for codebase chunks)
+CODEBASE_EMBEDDING_MODEL = 'nomic-ai/nomic-embed-text-v1.5'
 DEFAULT_MODEL = os.environ.get('MEMORY_CODEBASE_MODEL', CODEBASE_EMBEDDING_MODEL)
 MODEL_DIMS = {
     'all-MiniLM-L6-v2': 384,
@@ -55,6 +55,7 @@ MODEL_DIMS = {
     'all-mpnet-base-v2': 768,
     'bge-large-en-v1.5': 1024,
     'nomic-ai/CodeRankEmbed': 768,
+    'nomic-ai/nomic-embed-text-v1.5': 768,
 }
 MODEL_PREFIXES = {
     'bge-base-en-v1.5': 'BAAI/bge-base-en-v1.5',

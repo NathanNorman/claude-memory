@@ -634,11 +634,11 @@ class VectorSearchBackend:
     DEFAULT_BIT_WIDTH = 4
     RERANK_K = 30  # Candidates for exact reranking
 
-    # Dual-model architecture: CodeRankEmbed for codebase, bge-base for memory
-    CODEBASE_EMBEDDING_MODEL = 'nomic-ai/CodeRankEmbed'
-    CODEBASE_QUERY_PREFIX = 'Represent this query for searching relevant code: '
+    # Dual-model architecture: nomic-embed-text-v1.5 for codebase, bge-base for memory
+    CODEBASE_EMBEDDING_MODEL = 'nomic-ai/nomic-embed-text-v1.5'
+    CODEBASE_QUERY_PREFIX = 'search_query: '
 
-    # Model name → embedding dimensions
+    # Model name → native embedding dimensions (before Matryoshka truncation)
     MODEL_DIMS = {
         'all-MiniLM-L6-v2': 384,
         'bge-small-en-v1.5': 384,
@@ -646,14 +646,16 @@ class VectorSearchBackend:
         'all-mpnet-base-v2': 768,
         'bge-large-en-v1.5': 1024,
         'nomic-ai/CodeRankEmbed': 768,
+        'nomic-ai/nomic-embed-text-v1.5': 768,
     }
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
         self._model = None
-        self._codebase_model = None  # Lazy-loaded CodeRankEmbed for codebase queries
+        self._codebase_model = None  # Lazy-loaded nomic-embed-text-v1.5 for codebase queries
         self._init_failed = False
+        self._codebase_stored_dims: int = 0  # Auto-detected from BLOB size
 
         # Configurable model via env var (for memory/conversation)
         self.MODEL_NAME = os.environ.get('MEMORY_EMBEDDING_MODEL', self.DEFAULT_MODEL)
@@ -776,6 +778,30 @@ class VectorSearchBackend:
                         f'Codebase model mismatch: DB has {cb_model}, '
                         f'configured {self.CODEBASE_EMBEDDING_MODEL}. '
                         f'Run codebase-index.py to reindex codebase chunks.'
+                    )
+        except Exception:
+            pass
+
+        # Auto-detect codebase stored dimension from meta table or BLOB size
+        try:
+            dims_row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'codebase_embedding_dims'"
+            ).fetchone()
+            if dims_row:
+                self._codebase_stored_dims = int(dims_row['value'])
+                log.info(f'Codebase stored dimension: {self._codebase_stored_dims}d')
+            else:
+                # Fallback: detect from first codebase BLOB size
+                blob_row = conn.execute(
+                    "SELECT embedding FROM chunks WHERE file_path LIKE 'codebase:%' "
+                    "AND embedding IS NOT NULL LIMIT 1"
+                ).fetchone()
+                if blob_row and blob_row['embedding']:
+                    blob_len = len(blob_row['embedding'])
+                    self._codebase_stored_dims = blob_len // 4  # float32 = 4 bytes
+                    log.info(
+                        f'Codebase dimension auto-detected from BLOB: '
+                        f'{self._codebase_stored_dims}d ({blob_len} bytes)'
                     )
         except Exception:
             pass
@@ -961,10 +987,17 @@ class VectorSearchBackend:
         import numpy as np
         from quantize import batch_quantized_dot_products
 
-        # Apply asymmetric query prefix for CodeRankEmbed
+        # Apply asymmetric query prefix
         prefixed_query = self.CODEBASE_QUERY_PREFIX + query
         query_vec = model.encode(prefixed_query, normalize_embeddings=True)
         query_vec = np.array(query_vec, dtype=np.float32).flatten()
+
+        # Matryoshka: truncate query embedding to match stored dimension
+        if self._codebase_stored_dims > 0 and len(query_vec) > self._codebase_stored_dims:
+            query_vec = query_vec[:self._codebase_stored_dims]
+            norm = np.linalg.norm(query_vec)
+            if norm > 0:
+                query_vec = query_vec / norm
 
         if self._quantized and self._packed_list:
             from quantize import dequantize
