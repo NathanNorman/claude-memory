@@ -252,7 +252,39 @@ class FlatSearchBackend:
             CREATE INDEX IF NOT EXISTS idx_symbols_file
             ON symbols(file_path, codebase)
         ''')
+        # Composite indexes for graph traversal (direction + edge_type filtering)
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_edges_target_type
+            ON edges(target_file, edge_type, codebase)
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_edges_source_type
+            ON edges(source_file, edge_type, codebase)
+        ''')
+        self._conn.execute('ANALYZE')
         self._conn.commit()
+
+    def resolve_start_node(self, start_node: str, codebase: str = '') -> list[str]:
+        """Resolve a start_node to file path(s) for graph traversal.
+
+        If start_node contains '/' or looks like a file path (has a file extension),
+        treat as a file path literal. Otherwise, treat as a symbol name and look up
+        in the symbols table.
+        """
+        if '/' in start_node or re.search(r'\.\w{1,4}$', start_node):
+            return [start_node]
+
+        conn = self._ensure_conn()
+        query = 'SELECT DISTINCT file_path FROM symbols WHERE name = ?'
+        params: list = [start_node]
+        if codebase:
+            query += ' AND codebase = ?'
+            params.append(codebase)
+
+        rows = conn.execute(query, params).fetchall()
+        if not rows:
+            raise ValueError(f'No symbol found matching "{start_node}"')
+        return [row['file_path'] for row in rows]
 
     def upsert_codebase_meta(self, codebase: str, file_path: str, content_hash: str) -> None:
         """Upsert a row into codebase_meta for the given codebase and file."""
@@ -1725,6 +1757,7 @@ async def dependency_search(
     file_path: str,
     codebase: str = '',
     direction: str = 'imported_by',
+    edge_type: str = '',
     maxResults: int = 50,
 ) -> dict:
     """Search the dependency graph for files that import or are imported by a given file.
@@ -1734,9 +1767,11 @@ async def dependency_search(
 
     Args:
         file_path: Relative file path within the codebase (e.g., "src/main/java/.../Foo.java")
-        codebase: Codebase name (e.g., "toast-analytics"). Empty = search all.
+        codebase: Codebase name (e.g., "toast-analytics"). Empty = search all codebases.
         direction: "imported_by" = find files that import this file (reverse deps),
-                   "imports" = find files this file imports (forward deps)
+                   "imports" = find files this file imports (forward deps),
+                   "depended_on_by" = find build_dependency edges where metadata matches file_path
+        edge_type: Filter by edge type (e.g., "calls", "extends", "build_dependency"). Empty = all.
         maxResults: Maximum results to return (default 50)
     """
     if not flat_backend:
@@ -1744,16 +1779,24 @@ async def dependency_search(
 
     conn = flat_backend._ensure_conn()
 
-    if direction == 'imports':
-        query = 'SELECT target_file, edge_type, metadata FROM edges WHERE source_file = ?'
-        params: list = [file_path]
+    if direction == 'depended_on_by':
+        # Reverse build dependency lookup: find who depends on this artifact
+        query = 'SELECT source_file, edge_type, metadata, codebase FROM edges WHERE metadata LIKE ? AND edge_type = ?'
+        params: list = [f'%{file_path}%', 'build_dependency']
+    elif direction == 'imports':
+        query = 'SELECT target_file, edge_type, metadata, codebase FROM edges WHERE source_file = ?'
+        params = [file_path]
     else:
-        query = 'SELECT source_file, edge_type, metadata FROM edges WHERE target_file = ?'
+        query = 'SELECT source_file, edge_type, metadata, codebase FROM edges WHERE target_file = ?'
         params = [file_path]
 
-    if codebase:
+    if codebase and direction != 'depended_on_by':
         query += ' AND codebase = ?'
         params.append(codebase)
+
+    if edge_type and direction != 'depended_on_by':
+        query += ' AND edge_type = ?'
+        params.append(edge_type)
 
     query += f' LIMIT {int(maxResults)}'
 
@@ -1767,11 +1810,15 @@ async def dependency_search(
         dep_file = row[0]
         if dep_file is None:
             continue
-        results.append({
+        entry: dict[str, Any] = {
             'file': dep_file,
             'edge_type': row[1],
             'metadata': row[2],
-        })
+        }
+        # Include codebase in cross-codebase results
+        if not codebase:
+            entry['codebase'] = row[3]
+        results.append(entry)
 
     return {
         'file': file_path,
@@ -1839,6 +1886,173 @@ async def symbol_search(
         })
 
     return {'count': len(results), 'results': results}
+
+
+@mcp_app.tool()
+async def graph_traverse(
+    start_node: str,
+    codebase: str = '',
+    direction: str = 'downstream',
+    edge_types: str = '',
+    max_depth: int = 5,
+    max_results: int = 100,
+    include_paths: bool = False,
+) -> dict:
+    """Traverse the code dependency graph starting from a file or symbol.
+
+    Walk upstream (callers/dependents) or downstream (callees/dependencies)
+    through multi-hop edges (calls, extends, implements, imports).
+
+    Args:
+        start_node: File path, or bare symbol name to resolve via symbols table.
+        codebase: Codebase name. Empty = search all.
+        direction: "downstream" = walk callees/deps, "upstream" = walk callers/dependents.
+        edge_types: Comma-separated edge types to follow (e.g. "calls,extends"). Empty = all.
+        max_depth: Maximum traversal depth (default 5, cap 10).
+        max_results: Maximum nodes to return (default 100, cap 500).
+        include_paths: If true, return full paths from start to each node (slower).
+    """
+    if not flat_backend:
+        return {'error': 'Flat search backend not available', 'results': []}
+
+    conn = flat_backend._ensure_conn()
+
+    # Clamp parameters
+    max_depth = min(max(1, max_depth), 10)
+    max_results = min(max(1, max_results), 500)
+
+    # Resolve start_node to file paths
+    try:
+        start_files = flat_backend.resolve_start_node(start_node, codebase)
+    except ValueError as e:
+        return {'error': str(e), 'results': []}
+
+    # Parse edge_types filter
+    type_list = [t.strip() for t in edge_types.split(',') if t.strip()] if edge_types else []
+    type_filter = ''
+    type_params: list = []
+    if type_list:
+        placeholders = ','.join('?' for _ in type_list)
+        type_filter = f' AND edge_type IN ({placeholders})'
+        type_params = type_list
+
+    # Direction: upstream walks source->target reversed, downstream walks source->target forward
+    if direction == 'upstream':
+        # Base case: find edges WHERE target_file = start, walk to source_file
+        base_col = 'target_file'
+        walk_col = 'source_file'
+        join_col = 'target_file'
+    else:
+        # Base case: find edges WHERE source_file = start, walk to target_file
+        base_col = 'source_file'
+        walk_col = 'target_file'
+        join_col = 'source_file'
+
+    all_results = []
+
+    for start_file in start_files:
+        base_params = [start_file] + type_params
+        codebase_filter = ''
+        if codebase:
+            codebase_filter = ' AND codebase = ?'
+            base_params.append(codebase)
+
+        if not include_paths:
+            # Mode A: Reachability — UNION deduplicates automatically
+            cte_sql = f'''
+                WITH RECURSIVE reachable(file, depth) AS (
+                    SELECT {walk_col}, 1
+                    FROM edges
+                    WHERE {base_col} = ? AND {walk_col} IS NOT NULL{type_filter}{codebase_filter}
+                  UNION
+                    SELECT e.{walk_col}, r.depth + 1
+                    FROM edges e
+                    JOIN reachable r ON e.{join_col} = r.file
+                    WHERE e.{walk_col} IS NOT NULL
+                      AND r.depth < ?{type_filter}{codebase_filter}
+                )
+                SELECT file, MIN(depth) as min_depth
+                FROM reachable
+                GROUP BY file
+                ORDER BY min_depth
+                LIMIT ?
+            '''
+            # Build params: base_params for base case, then depth + type_params + codebase for recursive
+            recursive_type_params = type_params.copy()
+            recursive_codebase_params = [codebase] if codebase else []
+            params = base_params + [max_depth] + recursive_type_params + recursive_codebase_params + [max_results]
+
+            try:
+                rows = conn.execute(cte_sql, params).fetchall()
+            except Exception as e:
+                return {'error': f'Traversal query failed: {e}', 'results': []}
+
+            for row in rows:
+                all_results.append({
+                    'file': row[0],
+                    'depth': row[1],
+                    'start': start_file,
+                })
+        else:
+            # Mode B: Path tracking — UNION ALL + cycle detection via INSTR
+            cte_sql = f'''
+                WITH RECURSIVE paths(file, depth, path) AS (
+                    SELECT {walk_col}, 1, ? || ' -> ' || {walk_col}
+                    FROM edges
+                    WHERE {base_col} = ? AND {walk_col} IS NOT NULL{type_filter}{codebase_filter}
+                  UNION ALL
+                    SELECT e.{walk_col}, p.depth + 1, p.path || ' -> ' || e.{walk_col}
+                    FROM edges e
+                    JOIN paths p ON e.{join_col} = p.file
+                    WHERE e.{walk_col} IS NOT NULL
+                      AND p.depth < ?
+                      AND INSTR(p.path, e.{walk_col}) = 0{type_filter}{codebase_filter}
+                )
+                SELECT p.file, p.depth as min_depth, p.path
+                FROM paths p
+                INNER JOIN (
+                    SELECT file, MIN(depth) as md FROM paths GROUP BY file
+                ) best ON p.file = best.file AND p.depth = best.md
+                GROUP BY p.file
+                ORDER BY min_depth
+                LIMIT ?
+            '''
+            recursive_type_params = type_params.copy()
+            recursive_codebase_params = [codebase] if codebase else []
+            params = [start_file, start_file] + type_params + ([codebase] if codebase else []) + [max_depth] + recursive_type_params + recursive_codebase_params + [max_results]
+
+            try:
+                rows = conn.execute(cte_sql, params).fetchall()
+            except Exception as e:
+                return {'error': f'Path traversal query failed: {e}', 'results': []}
+
+            for row in rows:
+                entry: dict[str, Any] = {
+                    'file': row[0],
+                    'depth': row[1],
+                    'start': start_file,
+                    'path': row[2],
+                }
+                all_results.append(entry)
+
+    # Deduplicate across multiple start files, keep shortest depth
+    if len(start_files) > 1:
+        seen: dict[str, dict] = {}
+        for r in all_results:
+            f = r['file']
+            if f not in seen or r['depth'] < seen[f]['depth']:
+                seen[f] = r
+        all_results = sorted(seen.values(), key=lambda x: x['depth'])
+
+    all_results = all_results[:max_results]
+
+    return {
+        'start': start_node,
+        'direction': direction,
+        'edge_types': type_list or 'all',
+        'nodes_found': len(all_results),
+        'results': all_results,
+    }
 
 
 @mcp_app.tool()

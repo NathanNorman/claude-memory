@@ -889,6 +889,54 @@ def resolve_hierarchy_edges(conn: sqlite3.Connection) -> dict:
     return {'resolved': resolved, 'unresolved': still_unresolved}
 
 
+def index_build_dependencies(
+    conn: sqlite3.Connection,
+    name: str,
+    repo_path: Path,
+    incremental: bool = False,
+) -> dict:
+    """Parse build files and store dependencies as edges with edge_type='build_dependency'.
+
+    External deps: target_file=NULL, metadata=coordinate.
+    Internal project deps: target_file=module_path, metadata='project:<module>'.
+    """
+    from build_parser import parse_build_files
+
+    ensure_dep_tables(conn)
+
+    deps = parse_build_files(repo_path)
+    if not deps:
+        return {'build_deps': 0}
+
+    now_ts = int(time.time() * 1000)
+
+    # Clear old build_dependency edges for this codebase before inserting
+    conn.execute(
+        "DELETE FROM edges WHERE codebase = ? AND edge_type = 'build_dependency'",
+        (name,),
+    )
+
+    inserted = 0
+    for dep in deps:
+        target_file = None
+        metadata = dep['coordinate']
+
+        if dep.get('is_internal') and dep.get('module_path'):
+            target_file = dep['module_path']
+            metadata = f"project:{dep['module_path']}"
+
+        conn.execute(
+            'INSERT INTO edges (codebase, source_file, target_file, edge_type, metadata, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (name, dep.get('source_file', ''), target_file, 'build_dependency', metadata, now_ts),
+        )
+        inserted += 1
+
+    conn.commit()
+    print(f'[codebase-index] Stored {inserted} build dependencies for {name}', file=sys.stderr)
+    return {'build_deps': inserted}
+
+
 def main():
     parser = argparse.ArgumentParser(description='Index codebases for semantic search')
     parser.add_argument('--path', type=str, help='Path to repository root')
@@ -902,6 +950,10 @@ def main():
     parser.add_argument('--calls', action='store_true', help='Extract call graph (function-level call edges)')
     parser.add_argument('--resolve-hierarchy', action='store_true',
                         help='Resolve unresolved hierarchy edges against symbols table across all codebases')
+    parser.add_argument('--build-deps', action='store_true',
+                        help='Parse build files (Gradle, Maven, pip, npm) and store as build_dependency edges')
+    parser.add_argument('--resolve-cross-repo', action='store_true',
+                        help='Resolve cross-repo deps and type hierarchy against indexed codebases')
 
     args = parser.parse_args()
 
@@ -922,6 +974,16 @@ def main():
     if args.resolve_hierarchy:
         result = resolve_hierarchy_edges(conn)
         print(f'\nHierarchy resolution result: {result}')
+        conn.close()
+        return
+
+    if args.resolve_cross_repo:
+        from build_parser import resolve_cross_repo_deps, resolve_cross_repo_types
+        ensure_dep_tables(conn)
+        dep_result = resolve_cross_repo_deps(conn)
+        print(f'\nCross-repo dependency resolution: {dep_result}')
+        type_result = resolve_cross_repo_types(conn)
+        print(f'Cross-repo type resolution: {type_result}')
         conn.close()
         return
 
@@ -973,6 +1035,14 @@ def main():
             incremental=args.update,
         )
         print(f'\nCall graph result: {call_result}')
+
+    # Build dependency extraction pass
+    if args.build_deps:
+        build_result = index_build_dependencies(
+            conn, args.name, repo_path,
+            incremental=args.update,
+        )
+        print(f'\nBuild dependency result: {build_result}')
 
     conn.close()
 
