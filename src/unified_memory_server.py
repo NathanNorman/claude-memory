@@ -262,6 +262,29 @@ class FlatSearchBackend:
             CREATE INDEX IF NOT EXISTS idx_edges_source_type
             ON edges(source_file, edge_type, codebase)
         ''')
+        # Communities table for Louvain clustering results
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS communities (
+                codebase TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                community_id INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (codebase, file_path)
+            )
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_communities_codebase_community
+            ON communities(codebase, community_id)
+        ''')
+        # Track edge count at community computation time
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_meta (
+                codebase TEXT PRIMARY KEY,
+                edge_count INTEGER NOT NULL,
+                community_count INTEGER NOT NULL,
+                computed_at INTEGER NOT NULL
+            )
+        ''')
         self._conn.execute('ANALYZE')
         self._conn.commit()
 
@@ -2372,6 +2395,235 @@ async def graph_traverse(
         'results': all_results,
         'engine': 'cte',
     }
+
+
+def compute_communities(conn: sqlite3.Connection, codebase: str) -> dict:
+    """Run Louvain community detection on call+import edges for a codebase.
+
+    Stores results in the communities table. Returns stats.
+    """
+    try:
+        import igraph as ig
+    except ImportError:
+        return {'error': 'igraph not installed'}
+
+    # Load call+import edges for this codebase
+    rows = conn.execute(
+        "SELECT source_file, target_file FROM edges "
+        "WHERE codebase = ? AND target_file IS NOT NULL "
+        "AND edge_type IN ('calls', 'import', 'static_import', 'wildcard_import', "
+        "'extends', 'implements')",
+        (codebase,),
+    ).fetchall()
+
+    if not rows:
+        return {'error': 'No edges found for codebase', 'codebase': codebase}
+
+    # Build igraph
+    node_set: set[str] = set()
+    edge_list: list[tuple[str, str]] = []
+    for row in rows:
+        node_set.add(row['source_file'])
+        node_set.add(row['target_file'])
+        edge_list.append((row['source_file'], row['target_file']))
+
+    node_list = sorted(node_set)
+    node_index = {name: idx for idx, name in enumerate(node_list)}
+
+    g = ig.Graph(directed=True)
+    g.add_vertices(len(node_list))
+    g.vs['name'] = node_list
+    g.add_edges([(node_index[s], node_index[t]) for s, t in edge_list])
+
+    # Run Louvain on undirected version (Louvain requires undirected)
+    g_undirected = g.as_undirected(mode='collapse')
+    partition = g_undirected.community_multilevel()
+
+    # Store results
+    now_ts = int(time.time() * 1000)
+    conn.execute('DELETE FROM communities WHERE codebase = ?', (codebase,))
+
+    for vid, community_id in enumerate(partition.membership):
+        conn.execute(
+            'INSERT INTO communities (codebase, file_path, community_id, updated_at) '
+            'VALUES (?, ?, ?, ?)',
+            (codebase, node_list[vid], community_id, now_ts),
+        )
+
+    # Store meta for staleness detection
+    edge_count = len(rows)
+    community_count = max(partition.membership) + 1 if partition.membership else 0
+    conn.execute(
+        'INSERT OR REPLACE INTO community_meta (codebase, edge_count, community_count, computed_at) '
+        'VALUES (?, ?, ?, ?)',
+        (codebase, edge_count, community_count, now_ts),
+    )
+    conn.commit()
+
+    return {
+        'codebase': codebase,
+        'nodes': len(node_list),
+        'edges': len(edge_list),
+        'communities': community_count,
+        'modularity': round(partition.modularity, 4),
+    }
+
+
+def _communities_are_stale(conn: sqlite3.Connection, codebase: str) -> bool:
+    """Check if community assignments are stale (>10% edge drift)."""
+    meta = conn.execute(
+        'SELECT edge_count FROM community_meta WHERE codebase = ?', (codebase,)
+    ).fetchone()
+    if not meta:
+        return True  # Never computed
+
+    current_edges = conn.execute(
+        "SELECT COUNT(*) as cnt FROM edges "
+        "WHERE codebase = ? AND target_file IS NOT NULL "
+        "AND edge_type IN ('calls', 'import', 'static_import', 'wildcard_import', "
+        "'extends', 'implements')",
+        (codebase,),
+    ).fetchone()['cnt']
+
+    old_count = meta['edge_count']
+    if old_count == 0:
+        return current_edges > 0
+    drift = abs(current_edges - old_count) / old_count
+    return drift > 0.10
+
+
+@mcp_app.tool()
+async def community_search(
+    codebase: str,
+    file_path: str = '',
+    list_all: bool = False,
+    show_bridges: bool = False,
+) -> dict:
+    """Search for architectural communities in a codebase's dependency graph.
+
+    Communities are groups of files that are tightly coupled via call/import edges,
+    detected using Louvain clustering. Use this to understand module boundaries.
+
+    Args:
+        codebase: Codebase name (required).
+        file_path: Find all files in the same community as this file.
+        list_all: List all communities with file counts and representative files.
+        show_bridges: Show edges that cross community boundaries (coupling points).
+    """
+    if not flat_backend:
+        return {'error': 'Flat search backend not available', 'results': []}
+
+    conn = flat_backend._ensure_conn()
+
+    # Check staleness — recompute if needed
+    recomputed = False
+    if _communities_are_stale(conn, codebase):
+        result = compute_communities(conn, codebase)
+        if 'error' in result:
+            return result
+        recomputed = True
+
+    if file_path:
+        # Find community for this file, return all members
+        row = conn.execute(
+            'SELECT community_id FROM communities WHERE codebase = ? AND file_path = ?',
+            (codebase, file_path),
+        ).fetchone()
+        if not row:
+            return {'error': f'File not found in communities: {file_path}'}
+
+        community_id = row['community_id']
+        members = conn.execute(
+            'SELECT file_path FROM communities WHERE codebase = ? AND community_id = ?',
+            (codebase, community_id),
+        ).fetchall()
+
+        # Sort by degree (edge count) descending
+        member_files = [m['file_path'] for m in members]
+        degree_counts = []
+        for mf in member_files:
+            cnt = conn.execute(
+                'SELECT COUNT(*) as cnt FROM edges WHERE codebase = ? AND (source_file = ? OR target_file = ?)',
+                (codebase, mf, mf),
+            ).fetchone()['cnt']
+            degree_counts.append((mf, cnt))
+        degree_counts.sort(key=lambda x: x[1], reverse=True)
+
+        return {
+            'community_id': community_id,
+            'file_count': len(member_files),
+            'files': [{'file': f, 'degree': d} for f, d in degree_counts],
+            'recomputed': recomputed,
+        }
+
+    elif list_all:
+        # List all communities
+        rows = conn.execute(
+            'SELECT community_id, COUNT(*) as file_count '
+            'FROM communities WHERE codebase = ? '
+            'GROUP BY community_id ORDER BY file_count DESC',
+            (codebase,),
+        ).fetchall()
+
+        communities = []
+        for row in rows:
+            cid = row['community_id']
+            # Get top 3 files by degree
+            top_files = conn.execute(
+                'SELECT c.file_path, '
+                '(SELECT COUNT(*) FROM edges e WHERE e.codebase = ? '
+                ' AND (e.source_file = c.file_path OR e.target_file = c.file_path)) as degree '
+                'FROM communities c WHERE c.codebase = ? AND c.community_id = ? '
+                'ORDER BY degree DESC LIMIT 3',
+                (codebase, codebase, cid),
+            ).fetchall()
+
+            communities.append({
+                'community_id': cid,
+                'file_count': row['file_count'],
+                'representative_files': [
+                    {'file': r['file_path'], 'degree': r['degree']} for r in top_files
+                ],
+            })
+
+        return {
+            'codebase': codebase,
+            'total_communities': len(communities),
+            'communities': communities,
+            'recomputed': recomputed,
+        }
+
+    elif show_bridges:
+        # Find edges crossing community boundaries
+        bridge_rows = conn.execute(
+            'SELECT e.source_file, e.target_file, e.edge_type, '
+            'c1.community_id as source_community, c2.community_id as target_community '
+            'FROM edges e '
+            'JOIN communities c1 ON c1.codebase = e.codebase AND c1.file_path = e.source_file '
+            'JOIN communities c2 ON c2.codebase = e.codebase AND c2.file_path = e.target_file '
+            'WHERE e.codebase = ? AND c1.community_id != c2.community_id '
+            'LIMIT 200',
+            (codebase,),
+        ).fetchall()
+
+        bridges = []
+        for row in bridge_rows:
+            bridges.append({
+                'source': row['source_file'],
+                'target': row['target_file'],
+                'edge_type': row['edge_type'],
+                'source_community': row['source_community'],
+                'target_community': row['target_community'],
+            })
+
+        return {
+            'codebase': codebase,
+            'bridge_count': len(bridges),
+            'bridges': bridges,
+            'recomputed': recomputed,
+        }
+
+    return {'error': 'Specify file_path, list_all=true, or show_bridges=true'}
 
 
 @mcp_app.tool()

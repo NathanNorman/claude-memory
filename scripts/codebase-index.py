@@ -954,6 +954,8 @@ def main():
                         help='Parse build files (Gradle, Maven, pip, npm) and store as build_dependency edges')
     parser.add_argument('--resolve-cross-repo', action='store_true',
                         help='Resolve cross-repo deps and type hierarchy against indexed codebases')
+    parser.add_argument('--communities', action='store_true',
+                        help='Run Louvain community detection on the dependency graph')
 
     args = parser.parse_args()
 
@@ -1043,6 +1045,36 @@ def main():
             incremental=args.update,
         )
         print(f'\nBuild dependency result: {build_result}')
+
+    # Community detection pass
+    if args.communities:
+        from unified_memory_server import compute_communities
+        ensure_dep_tables(conn)
+        # Ensure communities/community_meta tables exist
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS communities (
+                codebase TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                community_id INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (codebase, file_path)
+            )
+        ''')
+        conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_communities_codebase_community
+            ON communities(codebase, community_id)
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_meta (
+                codebase TEXT PRIMARY KEY,
+                edge_count INTEGER NOT NULL,
+                community_count INTEGER NOT NULL,
+                computed_at INTEGER NOT NULL
+            )
+        ''')
+        conn.commit()
+        comm_result = compute_communities(conn, args.name)
+        print(f'\nCommunity detection result: {comm_result}')
 
     conn.close()
 
