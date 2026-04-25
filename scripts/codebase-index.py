@@ -531,6 +531,11 @@ def ensure_dep_tables(conn: sqlite3.Connection) -> None:
         conn.execute('ALTER TABLE edges ADD COLUMN confidence REAL')
     except sqlite3.OperationalError:
         pass  # Column already exists
+    # Add metadata column to symbols table for LLM labels (idempotent migration)
+    try:
+        conn.execute('ALTER TABLE symbols ADD COLUMN metadata TEXT')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
 
 
@@ -963,6 +968,145 @@ def index_build_dependencies(
     return {'build_deps': inserted}
 
 
+def identify_high_value_nodes(
+    conn: sqlite3.Connection,
+    codebase: str,
+    min_incoming_edges: int = 5,
+) -> list[dict]:
+    """Identify high-value symbols for LLM labeling.
+
+    Criteria:
+    - Symbols with >N incoming edges (callers/dependents)
+    - Public API annotations (@RestController, @GetMapping, export)
+    - Module entry points (main, index, app files)
+    """
+    ensure_dep_tables(conn)
+    candidates = []
+
+    # 1. Symbols with many incoming edges
+    rows = conn.execute(
+        'SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.end_line, s.metadata, '
+        '(SELECT COUNT(*) FROM edges e WHERE e.target_file = s.file_path AND e.codebase = s.codebase) as incoming '
+        'FROM symbols s WHERE s.codebase = ? '
+        'HAVING incoming >= ?',
+        (codebase, min_incoming_edges),
+    ).fetchall()
+    for r in rows:
+        candidates.append(dict(r))
+
+    # 2. Entry point files (main, index, app)
+    seen_ids = {c['id'] for c in candidates}
+    entry_patterns = ['%/main.%', '%/index.%', '%/app.%', '%/Application.%', '%/server.%']
+    for pattern in entry_patterns:
+        rows = conn.execute(
+            'SELECT id, file_path, name, kind, start_line, end_line, metadata '
+            'FROM symbols WHERE codebase = ? AND file_path LIKE ?',
+            (codebase, pattern),
+        ).fetchall()
+        for r in rows:
+            if r['id'] not in seen_ids:
+                d = dict(r)
+                d['incoming'] = 0
+                candidates.append(d)
+                seen_ids.add(r['id'])
+
+    return candidates
+
+
+def label_nodes_batch(
+    conn: sqlite3.Connection,
+    codebase: str,
+    candidates: list[dict],
+    api_key: str,
+    delay_ms: int = 100,
+) -> dict:
+    """Send high-value node signatures to GPT-4o-mini for semantic labeling.
+
+    Labels are cached in symbols.metadata JSON (key: 'label').
+    Nodes with unchanged content hashes are skipped.
+    """
+    import time as time_mod
+    try:
+        import openai
+    except ImportError:
+        return {'error': 'openai package not installed. Run: pip install openai'}
+
+    client = openai.OpenAI(api_key=api_key)
+    labeled = 0
+    skipped = 0
+    errors = 0
+
+    for candidate in candidates:
+        sym_id = candidate['id']
+        file_path = candidate['file_path']
+
+        # Check if already labeled with same content
+        existing_meta = candidate.get('metadata')
+        if existing_meta:
+            try:
+                meta = json.loads(existing_meta)
+                if 'label' in meta and 'content_hash' in meta:
+                    # Read current file content hash from codebase_meta
+                    cm_row = conn.execute(
+                        'SELECT content_hash FROM codebase_meta WHERE codebase = ? AND file_path = ?',
+                        (codebase, file_path),
+                    ).fetchone()
+                    if cm_row and cm_row['content_hash'] == meta['content_hash']:
+                        skipped += 1
+                        continue
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Build context: symbol name + kind + file path
+        context = f"{candidate['kind']} {candidate['name']} in {file_path}"
+        # Try to get a snippet of the source from chunks
+        chunk_row = conn.execute(
+            "SELECT content FROM chunks WHERE file_path LIKE ? AND start_line <= ? AND end_line >= ? LIMIT 1",
+            (f'codebase:{codebase}/{file_path}', candidate['start_line'], candidate['start_line']),
+        ).fetchone()
+        if chunk_row:
+            snippet = chunk_row['content'][:500]
+            context += f'\n\nCode:\n{snippet}'
+
+        try:
+            response = client.chat.completions.create(
+                model='gpt-4o-mini',
+                messages=[{
+                    'role': 'user',
+                    'content': (
+                        f'Describe what this code element does in ONE sentence (max 100 chars).\n\n{context}'
+                    ),
+                }],
+                max_tokens=50,
+                temperature=0,
+            )
+            label = response.choices[0].message.content.strip()[:100]
+
+            # Get content hash for cache invalidation
+            cm_row = conn.execute(
+                'SELECT content_hash FROM codebase_meta WHERE codebase = ? AND file_path = ?',
+                (codebase, file_path),
+            ).fetchone()
+            content_hash_val = cm_row['content_hash'] if cm_row else ''
+
+            meta_json = json.dumps({'label': label, 'content_hash': content_hash_val})
+            conn.execute(
+                'UPDATE symbols SET metadata = ? WHERE id = ?',
+                (meta_json, sym_id),
+            )
+            labeled += 1
+
+            if delay_ms > 0:
+                time_mod.sleep(delay_ms / 1000.0)
+
+        except Exception as e:
+            print(f'[label] Failed to label {candidate["name"]}: {e}', file=sys.stderr)
+            errors += 1
+
+    conn.commit()
+    return {'labeled': labeled, 'skipped': skipped, 'errors': errors}
+
+
 def main():
     parser = argparse.ArgumentParser(description='Index codebases for semantic search')
     parser.add_argument('--path', type=str, help='Path to repository root')
@@ -986,6 +1130,12 @@ def main():
                         help='Run SCIP indexers as optional Tier 2 pass (requires working build)')
     parser.add_argument('--dims', type=int, default=0,
                         help='Matryoshka truncation dimension (64/128/256/384/512/768, default: 256 for nomic model, 0=full for others)')
+    parser.add_argument('--label', action='store_true',
+                        help='Run LLM semantic labeling on high-value nodes via GPT-4o-mini')
+    parser.add_argument('--label-delay', type=int, default=100,
+                        help='Delay between GPT-4o-mini API calls in ms (default: 100)')
+    parser.add_argument('--label-min-edges', type=int, default=5,
+                        help='Minimum incoming edges for a node to be labeled (default: 5)')
 
     args = parser.parse_args()
 
@@ -1155,6 +1305,30 @@ def main():
             print(f'\nSCIP indexing result: {total_scip_edges} edges merged', file=sys.stderr)
         else:
             print('[scip] No supported languages detected in repo', file=sys.stderr)
+
+    # LLM semantic labeling pass
+    if args.label:
+        ensure_dep_tables(conn)
+        candidates = identify_high_value_nodes(conn, args.name, min_incoming_edges=args.label_min_edges)
+        print(f'[label] Found {len(candidates)} high-value nodes for labeling', file=sys.stderr)
+        if candidates:
+            # Get API key from keychain
+            import subprocess as sp
+            try:
+                api_key = sp.run(
+                    ['security', 'find-generic-password', '-a', os.getlogin(), '-s', 'openai-api-key', '-w'],
+                    capture_output=True, text=True,
+                ).stdout.strip()
+            except Exception:
+                api_key = os.environ.get('OPENAI_API_KEY', '')
+            if not api_key:
+                print('[label] Error: No OpenAI API key found (keychain or OPENAI_API_KEY env)', file=sys.stderr)
+            else:
+                label_result = label_nodes_batch(
+                    conn, args.name, candidates, api_key,
+                    delay_ms=args.label_delay,
+                )
+                print(f'\nLLM labeling result: {label_result}')
 
     # Community detection pass
     if args.communities:

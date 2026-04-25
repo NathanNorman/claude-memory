@@ -262,6 +262,11 @@ class FlatSearchBackend:
             CREATE INDEX IF NOT EXISTS idx_edges_source_type
             ON edges(source_file, edge_type, codebase)
         ''')
+        # Add metadata column to symbols table for LLM labels (idempotent migration)
+        try:
+            self._conn.execute('ALTER TABLE symbols ADD COLUMN metadata TEXT')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         # Communities table for Louvain clustering results
         self._conn.execute('''
             CREATE TABLE IF NOT EXISTS communities (
@@ -2062,15 +2067,36 @@ async def codebase_search(
         merged = flat_hits
 
     results = []
+    conn = flat_backend._ensure_conn()
     for r in merged[:maxResults]:
-        results.append({
+        entry = {
             'path': r['file_path'],
             'title': r.get('title', ''),
             'snippet': smart_truncate(r.get('content', ''), 300),
             'score': round(r.get('score', 0), 3),
             'startLine': r.get('start_line'),
             'endLine': r.get('end_line'),
-        })
+        }
+        # Look up LLM label for matching symbols in this file
+        fp = r['file_path']
+        if fp.startswith('codebase:'):
+            # Strip codebase prefix: "codebase:name/rel/path" -> "rel/path"
+            parts = fp.split('/', 1)
+            rel_path = parts[1] if len(parts) > 1 else fp
+            cb_name = parts[0].replace('codebase:', '') if ':' in parts[0] else ''
+            try:
+                sym_row = conn.execute(
+                    'SELECT metadata FROM symbols WHERE file_path = ? AND codebase = ? '
+                    'AND metadata IS NOT NULL LIMIT 1',
+                    (rel_path, cb_name),
+                ).fetchone()
+                if sym_row and sym_row['metadata']:
+                    meta = json.loads(sym_row['metadata'])
+                    if 'label' in meta:
+                        entry['label'] = meta['label']
+            except Exception:
+                pass
+        results.append(entry)
 
     return {'results': results}
 
@@ -2180,7 +2206,7 @@ async def symbol_search(
     else:
         name_clause = 'name = ?'
 
-    query = f'SELECT id, codebase, file_path, name, kind, start_line, end_line FROM symbols WHERE {name_clause}'
+    query = f'SELECT id, codebase, file_path, name, kind, start_line, end_line, metadata FROM symbols WHERE {name_clause}'
     params: list = [name]
 
     if codebase:
@@ -2199,14 +2225,23 @@ async def symbol_search(
 
     results = []
     for row in rows:
-        results.append({
+        entry = {
             'codebase': row['codebase'],
             'file': row['file_path'],
             'name': row['name'],
             'kind': row['kind'],
             'startLine': row['start_line'],
             'endLine': row['end_line'],
-        })
+        }
+        # Include LLM label if available
+        if row['metadata']:
+            try:
+                meta = json.loads(row['metadata'])
+                if 'label' in meta:
+                    entry['label'] = meta['label']
+            except (json.JSONDecodeError, TypeError):
+                pass
+        results.append(entry)
 
     return {'count': len(results), 'results': results}
 
