@@ -2833,6 +2833,14 @@ async def get_status() -> dict:
     else:
         result['vector'] = {'status': 'unavailable'}
 
+    # Pipeline health (from job queue)
+    try:
+        from job_queue import JobQueue
+        jq = JobQueue(DB_PATH)
+        result['pipeline'] = jq.get_pipeline_health()
+    except Exception:
+        pass  # job_queue may not be available
+
     # Graph sidecar
     if graph_sidecar is not None:
         result['graph'] = graph_sidecar.get_stats()

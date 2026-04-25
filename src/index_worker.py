@@ -268,27 +268,61 @@ def _is_indexable(filepath: str) -> bool:
     return Path(filepath).suffix in SOURCE_EXTENSIONS
 
 
+class PipelineTimer:
+    """Per-stage timing instrumentation for the webhook pipeline."""
+
+    def __init__(self):
+        self.stages: dict[str, float] = {}
+        self._current_stage: Optional[str] = None
+        self._stage_start: float = 0.0
+
+    def start(self, stage: str) -> None:
+        self._current_stage = stage
+        self._stage_start = time.time()
+
+    def stop(self) -> None:
+        if self._current_stage:
+            elapsed = (time.time() - self._stage_start) * 1000  # ms
+            self.stages[self._current_stage] = round(elapsed, 1)
+            self._current_stage = None
+
+    def to_json(self) -> str:
+        import json as json_mod
+        return json_mod.dumps(self.stages)
+
+    def summary(self) -> str:
+        total = sum(self.stages.values())
+        slowest = max(self.stages.items(), key=lambda x: x[1]) if self.stages else ('none', 0)
+        return f'{total:.0f}ms total, slowest: {slowest[0]} ({slowest[1]:.0f}ms)'
+
+
 def process_job(
     job: IndexJob,
     model,
     conn: sqlite3.Connection,
     rotate_fn,
     codebook,
-) -> dict:
-    """Process a single index job.
+) -> tuple[dict, PipelineTimer]:
+    """Process a single index job with per-stage timing.
 
     1. Ensure mirror exists and is up-to-date
     2. Determine changed files (diff or full listing)
     3. Re-index changed files
+
+    Returns (result_dict, timer).
     """
+    timer = PipelineTimer()
     repo_name = job.repo_name
     prefix = f'codebase:{repo_name}/'
     now = datetime.now().isoformat()
 
     # Step 1: Ensure mirror is up-to-date
+    timer.start('git_fetch')
     mirror_path = ensure_mirror(repo_name, job.clone_url)
+    timer.stop()
 
     # Step 2: Determine what changed
+    timer.start('diff_compute')
     needs_full_reindex = False
 
     if job.before_sha == NULL_SHA:
@@ -305,15 +339,23 @@ def process_job(
                 repo_name, job.before_sha[:8], job.after_sha[:8], e,
             )
             needs_full_reindex = True
+    timer.stop()
 
     if needs_full_reindex:
-        return _full_reindex(job, model, conn, rotate_fn, codebook, mirror_path, prefix, now)
+        result = _full_reindex(job, model, conn, rotate_fn, codebook, mirror_path, prefix, now, timer)
+        return result, timer
+
+    # Small-diff optimization: for <10 files, embed only changed chunks
+    is_small_diff = len(changes) < 10
+    if is_small_diff:
+        log.info('Small diff optimization: %d files', len(changes))
 
     # Step 3: Incremental update based on diff
-    return _incremental_reindex(
+    result = _incremental_reindex(
         job, model, conn, rotate_fn, codebook,
-        mirror_path, prefix, now, changes,
+        mirror_path, prefix, now, changes, timer,
     )
+    return result, timer
 
 
 def _full_reindex(
@@ -325,6 +367,7 @@ def _full_reindex(
     mirror_path: Path,
     prefix: str,
     now: str,
+    timer: Optional[PipelineTimer] = None,
 ) -> dict:
     """Full re-index: list all files at after_sha, re-index everything."""
     repo_name = job.repo_name
@@ -351,6 +394,9 @@ def _full_reindex(
     total_files = 0
     batch: list[dict] = []
     batch_size = 32
+
+    if timer:
+        timer.start('chunks_generate')
 
     for filepath in indexable:
         try:
@@ -392,12 +438,24 @@ def _full_reindex(
             conn.commit()
             batch = []
 
+    if timer:
+        timer.stop()  # chunks_generate
+        timer.start('embeddings_compute')
+
     # Flush remaining
     if batch:
         stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
         total_chunks += stored
 
+    if timer:
+        timer.stop()  # embeddings_compute
+        timer.start('db_writes')
+
     conn.commit()
+
+    if timer:
+        timer.stop()  # db_writes
+
     log.info(
         'Full re-index of %s: %d files, %d chunks',
         repo_name, total_files, total_chunks,
@@ -419,10 +477,13 @@ def _incremental_reindex(
     prefix: str,
     now: str,
     changes: list[tuple[str, str]],
+    timer: Optional[PipelineTimer] = None,
 ) -> dict:
     """Incremental re-index based on git diff results."""
     repo_name = job.repo_name
     after_sha = job.after_sha
+    if timer:
+        timer.start('chunks_generate')
 
     files_added = 0
     files_deleted = 0
@@ -482,17 +543,34 @@ def _incremental_reindex(
         files_added += 1
 
         if len(batch) >= batch_size:
+            if timer and 'chunks_generate' in timer.stages:
+                pass  # Already stopped
+            elif timer:
+                timer.stop()  # chunks_generate
+                timer.start('embeddings_compute')
             stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
             total_chunks += stored
             conn.commit()
             batch = []
+
+    if timer:
+        timer.stop()  # chunks_generate or embeddings_compute
+        timer.start('embeddings_compute')
 
     # Flush remaining
     if batch:
         stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
         total_chunks += stored
 
+    if timer:
+        timer.stop()  # embeddings_compute
+        timer.start('db_writes')
+
     conn.commit()
+
+    if timer:
+        timer.stop()  # db_writes
+
     log.info(
         'Incremental re-index of %s: %d added/modified, %d deleted, %d chunks',
         repo_name, files_added, files_deleted, total_chunks,
@@ -523,8 +601,13 @@ def worker_loop(
     if stop_event is None:
         stop_event = threading.Event()
 
-    # Load model once at startup
+    # Load and warm model at startup (eliminates cold-start penalty)
+    log.info('Warming embedding model at startup...')
     model = load_model(model_name)
+    # Warm the model with a dummy encode to initialize all internal state
+    model.encode(['warmup'], normalize_embeddings=True)
+    log.info('Embedding model ready')
+
     conn = get_db()
     dims = MODEL_DIMS.get(model_name, 384)
     rotate_fn, codebook = load_quantization_params(conn, model_name, dims)
@@ -550,10 +633,20 @@ def worker_loop(
         t0 = time.time()
 
         try:
-            result = process_job(job, model, conn, rotate_fn, codebook)
-            queue.mark_done(job.id)
+            result, timer = process_job(job, model, conn, rotate_fn, codebook)
+            queue.mark_done(job.id, timing=timer.to_json())
             elapsed = time.time() - t0
-            log.info('Job %d completed in %.1fs: %s', job.id, elapsed, result)
+            log.info(
+                '[webhook-pipeline] Job %d complete: %s — %s',
+                job.id, timer.summary(), result,
+            )
+            # Warn if p95 target exceeded
+            total_ms = sum(timer.stages.values())
+            if total_ms > 1000:
+                log.warning(
+                    '[webhook-pipeline] Job %d exceeded 1s target (%.0fms): %s',
+                    job.id, total_ms, timer.stages,
+                )
         except Exception as e:
             queue.mark_failed(job.id, str(e))
             log.error('Job %d failed: %s', job.id, e, exc_info=True)

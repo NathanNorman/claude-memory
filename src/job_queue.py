@@ -35,6 +35,7 @@ class IndexJob:
     created_at: float
     started_at: Optional[float]
     completed_at: Optional[float]
+    timing: Optional[str] = None  # JSON with per-stage timestamps
 
 
 class JobQueue:
@@ -68,9 +69,15 @@ class JobQueue:
                     error TEXT,
                     created_at REAL NOT NULL,
                     started_at REAL,
-                    completed_at REAL
+                    completed_at REAL,
+                    timing TEXT
                 )
             ''')
+            # Idempotent migration: add timing column if table already exists
+            try:
+                conn.execute('ALTER TABLE index_jobs ADD COLUMN timing TEXT')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_jobs_status_created
                 ON index_jobs (status, created_at)
@@ -178,14 +185,14 @@ class JobQueue:
         finally:
             conn.close()
 
-    def mark_done(self, job_id: int) -> None:
-        """Mark a job as successfully completed."""
+    def mark_done(self, job_id: int, timing: Optional[str] = None) -> None:
+        """Mark a job as successfully completed with optional timing data."""
         conn = self._get_conn()
         try:
             now = time.time()
             conn.execute(
-                "UPDATE index_jobs SET status = 'done', completed_at = ? WHERE id = ?",
-                (now, job_id),
+                "UPDATE index_jobs SET status = 'done', completed_at = ?, timing = ? WHERE id = ?",
+                (now, timing, job_id),
             )
             conn.commit()
             log.info('Job %d marked done', job_id)
@@ -203,5 +210,51 @@ class JobQueue:
             )
             conn.commit()
             log.warning('Job %d marked failed: %s', job_id, error)
+        finally:
+            conn.close()
+
+    def get_pipeline_health(self) -> dict:
+        """Get pipeline health metrics for the last hour.
+
+        Returns: jobs_last_hour, avg_latency_ms, p95_latency_ms, queue_depth.
+        """
+        conn = self._get_conn()
+        try:
+            now = time.time()
+            one_hour_ago = now - 3600
+
+            # Jobs completed in last hour
+            done_rows = conn.execute(
+                "SELECT started_at, completed_at FROM index_jobs "
+                "WHERE status = 'done' AND completed_at >= ?",
+                (one_hour_ago,),
+            ).fetchall()
+
+            latencies = []
+            for row in done_rows:
+                if row['started_at'] and row['completed_at']:
+                    latency_ms = (row['completed_at'] - row['started_at']) * 1000
+                    latencies.append(latency_ms)
+
+            # Queue depth
+            pending = conn.execute(
+                "SELECT COUNT(*) as cnt FROM index_jobs WHERE status = 'pending'"
+            ).fetchone()['cnt']
+
+            result = {
+                'jobs_last_hour': len(done_rows),
+                'queue_depth': pending,
+            }
+
+            if latencies:
+                latencies.sort()
+                result['avg_latency_ms'] = round(sum(latencies) / len(latencies), 1)
+                p95_idx = int(len(latencies) * 0.95)
+                result['p95_latency_ms'] = round(latencies[min(p95_idx, len(latencies) - 1)], 1)
+            else:
+                result['avg_latency_ms'] = 0
+                result['p95_latency_ms'] = 0
+
+            return result
         finally:
             conn.close()
