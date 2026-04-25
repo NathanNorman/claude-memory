@@ -955,7 +955,7 @@ class VectorSearchBackend:
             return None
 
     def _ensure_codebase_model(self):
-        """Lazy-load CodeRankEmbed for codebase queries on first call."""
+        """Lazy-load nomic-embed-text-v1.5 for codebase queries on first call."""
         if self._codebase_model is not None:
             return self._codebase_model
         if self._init_failed:
@@ -971,10 +971,10 @@ class VectorSearchBackend:
             return None
 
     def search_codebase(self, query: str, limit: int) -> list[dict]:
-        """Vector search for codebase queries using CodeRankEmbed + query prefix.
+        """Vector search for codebase queries using nomic-embed-text-v1.5 + query prefix.
 
         Uses the codebase-specific model with asymmetric query prefix.
-        Falls back to the default model if CodeRankEmbed is unavailable.
+        Falls back to the default model if the codebase model is unavailable.
         """
         if self._init_failed or limit <= 0:
             return []
@@ -982,7 +982,7 @@ class VectorSearchBackend:
         if not self._ensure_index():
             return []
 
-        # Try CodeRankEmbed first, fall back to default model
+        # Try codebase model first, fall back to default model
         model = self._ensure_codebase_model()
         if model is None:
             model = self._ensure_model()
@@ -1916,7 +1916,7 @@ async def memory_search(
     flat_original = flat_backend.search_keyword(query, fetch_limit * 2)
 
     # Vector similarity search — synchronous, first call loads model (~2s), then fast
-    # Use CodeRankEmbed with query prefix when searching codebase source
+    # Use codebase model with query prefix when searching codebase source
     vector_hits: list[dict] = []
     if vector_backend:
         try:
@@ -2051,7 +2051,7 @@ async def codebase_search(
     flat_hits = flat_backend.search_keyword(query, fetch_limit * 2)
     flat_hits = [h for h in flat_hits if h['file_path'].startswith(prefix)]
 
-    # Vector search — use CodeRankEmbed with query prefix for codebase
+    # Vector search — use codebase model with query prefix
     vector_hits: list[dict] = []
     if vector_backend:
         try:

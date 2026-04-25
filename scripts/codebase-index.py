@@ -968,6 +968,70 @@ def index_build_dependencies(
     return {'build_deps': inserted}
 
 
+def _run_community_detection(conn: sqlite3.Connection, codebase: str) -> dict:
+    """Run Louvain community detection on call+import edges for a codebase.
+
+    Standalone version that avoids importing unified_memory_server (heavy MCP deps).
+    """
+    try:
+        import igraph as ig
+    except ImportError:
+        return {'error': 'igraph not installed'}
+
+    rows = conn.execute(
+        "SELECT source_file, target_file FROM edges "
+        "WHERE codebase = ? AND target_file IS NOT NULL "
+        "AND edge_type IN ('calls', 'import', 'static_import', 'wildcard_import', "
+        "'extends', 'implements')",
+        (codebase,),
+    ).fetchall()
+
+    if not rows:
+        return {'error': 'No edges found for codebase', 'codebase': codebase}
+
+    node_set: set[str] = set()
+    edge_list: list[tuple[str, str]] = []
+    for row in rows:
+        node_set.add(row['source_file'])
+        node_set.add(row['target_file'])
+        edge_list.append((row['source_file'], row['target_file']))
+
+    node_list = sorted(node_set)
+    node_index = {name: idx for idx, name in enumerate(node_list)}
+
+    g = ig.Graph(directed=True)
+    g.add_vertices(len(node_list))
+    g.vs['name'] = node_list
+    g.add_edges([(node_index[s], node_index[t]) for s, t in edge_list])
+
+    g_undirected = g.as_undirected(mode='collapse')
+    partition = g_undirected.community_multilevel()
+
+    now_ts = int(time.time() * 1000)
+    conn.execute('DELETE FROM communities WHERE codebase = ?', (codebase,))
+    for vid, community_id in enumerate(partition.membership):
+        conn.execute(
+            'INSERT INTO communities (codebase, file_path, community_id, updated_at) VALUES (?, ?, ?, ?)',
+            (codebase, node_list[vid], community_id, now_ts),
+        )
+
+    edge_count = len(rows)
+    community_count = max(partition.membership) + 1 if partition.membership else 0
+    conn.execute(
+        'INSERT OR REPLACE INTO community_meta (codebase, edge_count, community_count, computed_at) VALUES (?, ?, ?, ?)',
+        (codebase, edge_count, community_count, now_ts),
+    )
+    conn.commit()
+
+    return {
+        'codebase': codebase,
+        'nodes': len(node_list),
+        'edges': len(edge_list),
+        'communities': community_count,
+        'modularity': round(partition.modularity, 4),
+    }
+
+
 def identify_high_value_nodes(
     conn: sqlite3.Connection,
     codebase: str,
@@ -985,10 +1049,11 @@ def identify_high_value_nodes(
 
     # 1. Symbols with many incoming edges
     rows = conn.execute(
-        'SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.end_line, s.metadata, '
-        '(SELECT COUNT(*) FROM edges e WHERE e.target_file = s.file_path AND e.codebase = s.codebase) as incoming '
-        'FROM symbols s WHERE s.codebase = ? '
-        'HAVING incoming >= ?',
+        'SELECT * FROM ('
+        '  SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.end_line, s.metadata, '
+        '  (SELECT COUNT(*) FROM edges e WHERE e.target_file = s.file_path AND e.codebase = s.codebase) as incoming '
+        '  FROM symbols s WHERE s.codebase = ?'
+        ') WHERE incoming >= ?',
         (codebase, min_incoming_edges),
     ).fetchall()
     for r in rows:
@@ -1332,7 +1397,6 @@ def main():
 
     # Community detection pass
     if args.communities:
-        from unified_memory_server import compute_communities
         ensure_dep_tables(conn)
         # Ensure communities/community_meta tables exist
         conn.execute('''
@@ -1357,7 +1421,7 @@ def main():
             )
         ''')
         conn.commit()
-        comm_result = compute_communities(conn, args.name)
+        comm_result = _run_community_detection(conn, args.name)
         print(f'\nCommunity detection result: {comm_result}')
 
     conn.close()

@@ -226,12 +226,7 @@ def _parse_scip_protobuf(scip_path: Path) -> list[dict]:
     This is a best-effort fallback when the scip CLI is not available.
     Returns an empty list if parsing fails (graceful degradation).
     """
-    try:
-        # Try importing google.protobuf
-        from google.protobuf import descriptor_pool, descriptor_pb2
-        log.info('Direct protobuf parsing not yet implemented — install scip CLI for full support')
-    except ImportError:
-        log.info('google.protobuf not available — install scip CLI for SCIP support')
+    log.info('Direct protobuf parsing not yet implemented — install scip CLI for full SCIP support')
     return []
 
 

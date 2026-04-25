@@ -7,6 +7,7 @@ and embedding pipeline.
 """
 
 import hashlib
+import json
 import logging
 import os
 import sqlite3
@@ -165,10 +166,15 @@ def embed_and_store_batch(
     rotate_fn,
     codebook,
     batch_size: int = 32,
+    truncate_dims: int = 0,
+    doc_prefix: str = '',
 ) -> int:
     """Embed a batch of chunks and store in the database.
 
-    Reused from codebase-index.py with identical logic.
+    Args:
+        truncate_dims: If > 0, truncate embeddings to this dimension and L2-renormalize
+                       (Matryoshka Representation Learning).
+        doc_prefix: Prefix to prepend to document text for asymmetric embedding models.
     """
     if not chunks:
         return 0
@@ -179,7 +185,10 @@ def embed_and_store_batch(
     texts = []
     for c in chunks:
         prefix = _build_structural_prefix(c['file_path'], c['title'])
-        texts.append(prefix + c['content'])
+        text = prefix + c['content']
+        if doc_prefix:
+            text = doc_prefix + text
+        texts.append(text)
     embeddings = model.encode(texts, normalize_embeddings=True, batch_size=batch_size)
 
     count = 0
@@ -188,6 +197,14 @@ def embed_and_store_batch(
         c_hash = content_hash(chunk['content'])
 
         emb_arr = np.array(emb, dtype=np.float32)
+
+        # Matryoshka truncation: truncate to target dims and L2-renormalize
+        if truncate_dims > 0 and len(emb_arr) > truncate_dims:
+            emb_arr = emb_arr[:truncate_dims]
+            norm = np.linalg.norm(emb_arr)
+            if norm > 0:
+                emb_arr = emb_arr / norm
+
         if rotate_fn is not None and codebook is not None:
             blob = quant_fn(emb_arr, rotate_fn, codebook)
         else:
@@ -287,8 +304,7 @@ class PipelineTimer:
             self._current_stage = None
 
     def to_json(self) -> str:
-        import json as json_mod
-        return json_mod.dumps(self.stages)
+        return json.dumps(self.stages)
 
     def summary(self) -> str:
         total = sum(self.stages.values())
@@ -302,6 +318,8 @@ def process_job(
     conn: sqlite3.Connection,
     rotate_fn,
     codebook,
+    truncate_dims: int = 0,
+    doc_prefix: str = '',
 ) -> tuple[dict, PipelineTimer]:
     """Process a single index job with per-stage timing.
 
@@ -342,18 +360,15 @@ def process_job(
     timer.stop()
 
     if needs_full_reindex:
-        result = _full_reindex(job, model, conn, rotate_fn, codebook, mirror_path, prefix, now, timer)
+        result = _full_reindex(job, model, conn, rotate_fn, codebook, mirror_path, prefix, now, timer,
+                               truncate_dims=truncate_dims, doc_prefix=doc_prefix)
         return result, timer
-
-    # Small-diff optimization: for <10 files, embed only changed chunks
-    is_small_diff = len(changes) < 10
-    if is_small_diff:
-        log.info('Small diff optimization: %d files', len(changes))
 
     # Step 3: Incremental update based on diff
     result = _incremental_reindex(
         job, model, conn, rotate_fn, codebook,
         mirror_path, prefix, now, changes, timer,
+        truncate_dims=truncate_dims, doc_prefix=doc_prefix,
     )
     return result, timer
 
@@ -368,6 +383,8 @@ def _full_reindex(
     prefix: str,
     now: str,
     timer: Optional[PipelineTimer] = None,
+    truncate_dims: int = 0,
+    doc_prefix: str = '',
 ) -> dict:
     """Full re-index: list all files at after_sha, re-index everything."""
     repo_name = job.repo_name
@@ -433,7 +450,8 @@ def _full_reindex(
         total_files += 1
 
         if len(batch) >= batch_size:
-            stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
+            stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook,
+                                             truncate_dims=truncate_dims, doc_prefix=doc_prefix)
             total_chunks += stored
             conn.commit()
             batch = []
@@ -444,7 +462,8 @@ def _full_reindex(
 
     # Flush remaining
     if batch:
-        stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
+        stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook,
+                                       truncate_dims=truncate_dims, doc_prefix=doc_prefix)
         total_chunks += stored
 
     if timer:
@@ -478,6 +497,8 @@ def _incremental_reindex(
     now: str,
     changes: list[tuple[str, str]],
     timer: Optional[PipelineTimer] = None,
+    truncate_dims: int = 0,
+    doc_prefix: str = '',
 ) -> dict:
     """Incremental re-index based on git diff results."""
     repo_name = job.repo_name
@@ -548,7 +569,8 @@ def _incremental_reindex(
             elif timer:
                 timer.stop()  # chunks_generate
                 timer.start('embeddings_compute')
-            stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
+            stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook,
+                                             truncate_dims=truncate_dims, doc_prefix=doc_prefix)
             total_chunks += stored
             conn.commit()
             batch = []
@@ -559,7 +581,8 @@ def _incremental_reindex(
 
     # Flush remaining
     if batch:
-        stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
+        stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook,
+                                       truncate_dims=truncate_dims, doc_prefix=doc_prefix)
         total_chunks += stored
 
     if timer:
@@ -612,6 +635,25 @@ def worker_loop(
     dims = MODEL_DIMS.get(model_name, 384)
     rotate_fn, codebook = load_quantization_params(conn, model_name, dims)
 
+    # Read stored Matryoshka dimension and doc prefix for consistent embeddings
+    stored_truncate_dims = 0
+    stored_doc_prefix = ''
+    try:
+        dims_row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'codebase_embedding_dims'"
+        ).fetchone()
+        if dims_row:
+            stored_truncate_dims = int(dims_row['value'])
+        model_row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'codebase_embedding_model'"
+        ).fetchone()
+        if model_row and 'nomic' in model_row['value']:
+            stored_doc_prefix = 'search_document: '
+    except Exception:
+        pass
+    if stored_truncate_dims:
+        log.info('Worker using Matryoshka truncation: %dd', stored_truncate_dims)
+
     log.info('Worker started (model=%s, poll_interval=%ds)', model_name, poll_interval)
 
     while not stop_event.is_set():
@@ -633,7 +675,9 @@ def worker_loop(
         t0 = time.time()
 
         try:
-            result, timer = process_job(job, model, conn, rotate_fn, codebook)
+            result, timer = process_job(job, model, conn, rotate_fn, codebook,
+                                        truncate_dims=stored_truncate_dims,
+                                        doc_prefix=stored_doc_prefix)
             queue.mark_done(job.id, timing=timer.to_json())
             elapsed = time.time() - t0
             log.info(
