@@ -956,6 +956,8 @@ def main():
                         help='Resolve cross-repo deps and type hierarchy against indexed codebases')
     parser.add_argument('--communities', action='store_true',
                         help='Run Louvain community detection on the dependency graph')
+    parser.add_argument('--scip', action='store_true',
+                        help='Run SCIP indexers as optional Tier 2 pass (requires working build)')
 
     args = parser.parse_args()
 
@@ -1045,6 +1047,58 @@ def main():
             incremental=args.update,
         )
         print(f'\nBuild dependency result: {build_result}')
+
+    # SCIP indexer pass (optional Tier 2 — higher confidence edges)
+    if args.scip:
+        from scip_parser import detect_scip_languages, run_scip_indexer, parse_scip_output
+        ensure_dep_tables(conn)
+        languages = detect_scip_languages(repo_path)
+        if languages:
+            print(f'[scip] Detected languages: {", ".join(languages)}', file=sys.stderr)
+            now_ts = int(time.time())
+            total_scip_edges = 0
+            for lang in languages:
+                scip_path = run_scip_indexer(repo_path, lang)
+                if scip_path is None:
+                    print(f'[scip] Skipping {lang} (indexer unavailable or build failed)', file=sys.stderr)
+                    continue
+                scip_edges = parse_scip_output(scip_path)
+                if not scip_edges:
+                    print(f'[scip] No edges extracted for {lang}', file=sys.stderr)
+                    continue
+                # Merge: SCIP edges replace tree-sitter edges for same call site
+                for edge in scip_edges:
+                    # Check if a tree-sitter edge exists for same source+target
+                    existing = conn.execute(
+                        'SELECT id FROM edges WHERE codebase = ? AND source_file = ? AND target_file = ? '
+                        "AND edge_type != 'build_dependency' LIMIT 1",
+                        (args.name, edge['source_file'], edge['target_file']),
+                    ).fetchone()
+                    if existing:
+                        # Replace with higher confidence SCIP edge
+                        conn.execute(
+                            'UPDATE edges SET edge_type = ?, metadata = ?, confidence = ?, updated_at = ? WHERE id = ?',
+                            (edge['edge_type'], edge['metadata'], edge['confidence'], now_ts, existing['id']),
+                        )
+                    else:
+                        # Insert new SCIP-only edge
+                        conn.execute(
+                            'INSERT INTO edges (codebase, source_file, target_file, edge_type, metadata, confidence, updated_at) '
+                            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                            (args.name, edge['source_file'], edge['target_file'],
+                             edge['edge_type'], edge['metadata'], edge['confidence'], now_ts),
+                        )
+                    total_scip_edges += 1
+                conn.commit()
+                # Clean up .scip file
+                try:
+                    scip_path.unlink()
+                except Exception:
+                    pass
+                print(f'[scip] {lang}: {len(scip_edges)} edges processed', file=sys.stderr)
+            print(f'\nSCIP indexing result: {total_scip_edges} edges merged', file=sys.stderr)
+        else:
+            print('[scip] No supported languages detected in repo', file=sys.stderr)
 
     # Community detection pass
     if args.communities:
