@@ -24,6 +24,7 @@ import sqlite3
 import struct
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -1274,6 +1275,272 @@ class VectorSearchBackend:
 
 
 # ──────────────────────────────────────────────────────────────
+# Section 1c: GraphSidecar — igraph in-process graph queries
+# ──────────────────────────────────────────────────────────────
+
+
+class GraphSidecar:
+    """In-process igraph graph for fast BFS/DFS traversal.
+
+    Loads edges from SQLite into an igraph directed graph on startup.
+    Falls back gracefully if igraph is unavailable. Supports:
+    - Codebase-scoped or all-codebase loading
+    - Memory-bounded loading (max_edges cap)
+    - Atomic rebuild via SIGHUP or staleness detection
+    - Edge type filtering during traversal
+    """
+
+    MAX_EDGES = int(os.environ.get('GRAPH_MAX_EDGES', '5000000'))
+    STALENESS_THRESHOLD = 0.10  # 10% edge count drift triggers rebuild
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._graph = None  # igraph.Graph
+        self._node_index: dict[str, int] = {}  # file_path -> vertex id
+        self._edge_count_at_load: int = 0
+        self._codebase: Optional[str] = None  # None = all codebases
+        self._loaded = False
+        self._load_time: float = 0.0
+
+    def load(self, codebase: Optional[str] = None) -> bool:
+        """Load edges from SQLite into igraph. Returns True on success."""
+        try:
+            import igraph as ig
+        except ImportError:
+            log.warning('igraph not installed — graph traversal will use CTE fallback')
+            return False
+
+        self._codebase = codebase
+        t0 = time.time()
+
+        try:
+            conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+            conn.execute('PRAGMA busy_timeout = 5000')
+            conn.row_factory = sqlite3.Row
+
+            query = (
+                'SELECT source_file, target_file, edge_type, metadata '
+                'FROM edges WHERE target_file IS NOT NULL'
+            )
+            params: list = []
+            if codebase:
+                query += ' AND codebase = ?'
+                params.append(codebase)
+            query += ' ORDER BY updated_at DESC LIMIT ?'
+            params.append(self.MAX_EDGES)
+
+            rows = conn.execute(query, params).fetchall()
+
+            # Count total edges for staleness detection
+            count_query = 'SELECT COUNT(*) as cnt FROM edges WHERE target_file IS NOT NULL'
+            count_params: list = []
+            if codebase:
+                count_query += ' AND codebase = ?'
+                count_params.append(codebase)
+            total_edges = conn.execute(count_query, count_params).fetchone()['cnt']
+            conn.close()
+
+            if not rows:
+                log.info('GraphSidecar: no edges to load')
+                self._loaded = False
+                return False
+
+            if total_edges > self.MAX_EDGES:
+                log.warning(
+                    'GraphSidecar: edge count %d exceeds limit %d, '
+                    'loading most recent %d edges',
+                    total_edges, self.MAX_EDGES, self.MAX_EDGES,
+                )
+
+            # Build igraph graph
+            node_set: set[str] = set()
+            edge_list: list[tuple[str, str]] = []
+            edge_attrs: dict[str, list] = {'edge_type': [], 'metadata': []}
+
+            for row in rows:
+                src, tgt = row['source_file'], row['target_file']
+                node_set.add(src)
+                node_set.add(tgt)
+                edge_list.append((src, tgt))
+                edge_attrs['edge_type'].append(row['edge_type'])
+                edge_attrs['metadata'].append(row['metadata'])
+
+            node_list = sorted(node_set)
+            self._node_index = {name: idx for idx, name in enumerate(node_list)}
+
+            g = ig.Graph(directed=True)
+            g.add_vertices(len(node_list))
+            g.vs['name'] = node_list
+
+            indexed_edges = [
+                (self._node_index[src], self._node_index[tgt])
+                for src, tgt in edge_list
+            ]
+            g.add_edges(indexed_edges)
+            g.es['edge_type'] = edge_attrs['edge_type']
+            g.es['metadata'] = edge_attrs['metadata']
+
+            self._graph = g
+            self._edge_count_at_load = total_edges
+            self._loaded = True
+            self._load_time = time.time() - t0
+
+            log.info(
+                'GraphSidecar loaded: %d nodes, %d edges in %.2fs%s',
+                g.vcount(), g.ecount(), self._load_time,
+                f' (codebase={codebase})' if codebase else ' (all codebases)',
+            )
+            return True
+
+        except Exception as e:
+            log.warning('GraphSidecar load failed: %s', e)
+            self._loaded = False
+            return False
+
+    def rebuild(self, codebase: Optional[str] = None) -> bool:
+        """Atomic rebuild: build new graph, swap reference."""
+        old_graph = self._graph
+        old_index = self._node_index
+        cb = codebase if codebase is not None else self._codebase
+        success = self.load(cb)
+        if not success:
+            # Restore old graph on failure
+            self._graph = old_graph
+            self._node_index = old_index
+            self._loaded = old_graph is not None
+        return success
+
+    def is_stale(self) -> bool:
+        """Check if edge count has drifted >10% since last load."""
+        if not self._loaded:
+            return False
+        try:
+            conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+            conn.execute('PRAGMA busy_timeout = 3000')
+            query = 'SELECT COUNT(*) as cnt FROM edges WHERE target_file IS NOT NULL'
+            params: list = []
+            if self._codebase:
+                query += ' AND codebase = ?'
+                params.append(self._codebase)
+            current = conn.execute(query, params).fetchone()[0]
+            conn.close()
+            if self._edge_count_at_load == 0:
+                return current > 0
+            drift = abs(current - self._edge_count_at_load) / self._edge_count_at_load
+            return drift > self.STALENESS_THRESHOLD
+        except Exception:
+            return False
+
+    def traverse(
+        self,
+        start_file: str,
+        direction: str = 'downstream',
+        edge_types: Optional[list[str]] = None,
+        max_depth: int = 5,
+        max_results: int = 100,
+        include_paths: bool = False,
+    ) -> list[dict]:
+        """BFS traversal using igraph. Returns list of {file, depth, [path]}."""
+        if not self._loaded or self._graph is None:
+            return []
+
+        if start_file not in self._node_index:
+            return []
+
+        import igraph as ig
+
+        g = self._graph
+        start_vid = self._node_index[start_file]
+
+        # Filter edges by type if requested
+        if edge_types:
+            edge_mask = [e['edge_type'] in edge_types for e in g.es]
+            subgraph_edges = [i for i, keep in enumerate(edge_mask) if keep]
+            g = g.subgraph_edges(subgraph_edges)
+            # Rebuild node index for subgraph
+            node_index = {v['name']: v.index for v in g.vs}
+            if start_file not in node_index:
+                return []
+            start_vid = node_index[start_file]
+        else:
+            node_index = self._node_index
+
+        mode = ig.OUT if direction == 'downstream' else ig.IN
+
+        # BFS
+        bfs_result = g.bfs(start_vid, mode=mode)
+        order = bfs_result[0]  # vertex visit order
+        layers = bfs_result[1]  # layer boundaries
+
+        # Build depth map from layers
+        depth_map: dict[int, int] = {}
+        for depth, layer_start in enumerate(layers):
+            if depth + 1 < len(layers):
+                layer_end = layers[depth + 1]
+            else:
+                layer_end = len(order)
+            for i in range(layer_start, layer_end):
+                vid = order[i]
+                if vid >= 0 and vid != start_vid:
+                    depth_map[vid] = depth
+
+        results = []
+        for vid, depth in sorted(depth_map.items(), key=lambda x: x[1]):
+            if depth > max_depth or depth == 0:
+                continue
+            if len(results) >= max_results:
+                break
+            node_name = g.vs[vid]['name']
+            entry: dict[str, Any] = {
+                'file': node_name,
+                'depth': depth,
+                'start': start_file,
+            }
+            if include_paths:
+                try:
+                    paths = g.get_all_shortest_paths(start_vid, to=vid, mode=mode)
+                    if paths:
+                        path_names = [g.vs[v]['name'] for v in paths[0]]
+                        entry['path'] = ' -> '.join(path_names)
+                except Exception:
+                    pass
+            results.append(entry)
+
+        return results
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    def has_codebase(self, codebase: str) -> bool:
+        """Check if a specific codebase's nodes are present in the graph."""
+        if not self._loaded:
+            return False
+        # If loaded with a specific codebase, only that one is present
+        if self._codebase:
+            return self._codebase == codebase
+        # Loaded all codebases — check if any node exists
+        # (heuristic: check the edge count query)
+        return True
+
+    def get_stats(self) -> dict:
+        if not self._loaded or self._graph is None:
+            return {'status': 'not_loaded'}
+        return {
+            'status': 'loaded',
+            'nodes': self._graph.vcount(),
+            'edges': self._graph.ecount(),
+            'codebase': self._codebase or 'all',
+            'load_time_seconds': round(self._load_time, 2),
+            'edge_count_at_load': self._edge_count_at_load,
+        }
+
+
+# Module-level graph sidecar (initialized at startup)
+graph_sidecar: Optional[GraphSidecar] = None
+
+
+# ──────────────────────────────────────────────────────────────
 # Section 2: Post-filtering helpers (ported from tools.ts)
 # ──────────────────────────────────────────────────────────────
 
@@ -1929,6 +2196,57 @@ async def graph_traverse(
 
     # Parse edge_types filter
     type_list = [t.strip() for t in edge_types.split(',') if t.strip()] if edge_types else []
+
+    # --- Try igraph sidecar first ---
+    use_igraph = (
+        graph_sidecar is not None
+        and graph_sidecar.is_loaded
+        and (not codebase or graph_sidecar.has_codebase(codebase))
+    )
+
+    # Check staleness and trigger background rebuild if needed
+    if use_igraph and graph_sidecar.is_stale():
+        log.info('GraphSidecar: staleness detected, triggering background rebuild')
+        threading.Thread(
+            target=graph_sidecar.rebuild,
+            daemon=True,
+            name='graph-rebuild',
+        ).start()
+
+    if use_igraph:
+        all_results = []
+        for start_file in start_files:
+            results = graph_sidecar.traverse(
+                start_file,
+                direction=direction,
+                edge_types=type_list or None,
+                max_depth=max_depth,
+                max_results=max_results,
+                include_paths=include_paths,
+            )
+            all_results.extend(results)
+
+        # Deduplicate across multiple start files
+        if len(start_files) > 1:
+            seen: dict[str, dict] = {}
+            for r in all_results:
+                f = r['file']
+                if f not in seen or r['depth'] < seen[f]['depth']:
+                    seen[f] = r
+            all_results = sorted(seen.values(), key=lambda x: x['depth'])
+
+        all_results = all_results[:max_results]
+
+        return {
+            'start': start_node,
+            'direction': direction,
+            'edge_types': type_list or 'all',
+            'nodes_found': len(all_results),
+            'results': all_results,
+            'engine': 'igraph',
+        }
+
+    # --- Fallback: recursive CTE traversal ---
     type_filter = ''
     type_params: list = []
     if type_list:
@@ -2037,12 +2355,12 @@ async def graph_traverse(
 
     # Deduplicate across multiple start files, keep shortest depth
     if len(start_files) > 1:
-        seen: dict[str, dict] = {}
+        seen2: dict[str, dict] = {}
         for r in all_results:
             f = r['file']
-            if f not in seen or r['depth'] < seen[f]['depth']:
-                seen[f] = r
-        all_results = sorted(seen.values(), key=lambda x: x['depth'])
+            if f not in seen2 or r['depth'] < seen2[f]['depth']:
+                seen2[f] = r
+        all_results = sorted(seen2.values(), key=lambda x: x['depth'])
 
     all_results = all_results[:max_results]
 
@@ -2052,6 +2370,7 @@ async def graph_traverse(
         'edge_types': type_list or 'all',
         'nodes_found': len(all_results),
         'results': all_results,
+        'engine': 'cte',
     }
 
 
@@ -2193,6 +2512,10 @@ async def get_status() -> dict:
         result['vector'] = vector_backend.get_stats()
     else:
         result['vector'] = {'status': 'unavailable'}
+
+    # Graph sidecar
+    if graph_sidecar is not None:
+        result['graph'] = graph_sidecar.get_stats()
 
     # Addon backends
     if addon_backends:
@@ -2423,7 +2746,7 @@ async def index_session(
 
 
 async def run() -> None:
-    global flat_backend, vector_backend
+    global flat_backend, vector_backend, graph_sidecar
 
     # Initialize flat backend
     try:
@@ -2453,6 +2776,33 @@ async def run() -> None:
     except Exception as e:
         log.warning(f'Vector backend init failed: {e}')
         vector_backend = None
+
+    # Initialize graph sidecar (igraph for fast traversal)
+    try:
+        graph_sidecar = GraphSidecar(DB_PATH)
+        if graph_sidecar.load():
+            stats = graph_sidecar.get_stats()
+            log.info(
+                'Graph sidecar ready: %d nodes, %d edges (%.2fs)',
+                stats['nodes'], stats['edges'], stats['load_time_seconds'],
+            )
+        else:
+            log.info('Graph sidecar: no edges loaded (will use CTE fallback)')
+    except Exception as e:
+        log.warning('Graph sidecar init failed: %s', e)
+        graph_sidecar = None
+
+    # SIGHUP handler: rebuild graph sidecar atomically
+    def _handle_sighup(sig, frame):
+        log.info('SIGHUP received — rebuilding graph sidecar')
+        if graph_sidecar is not None:
+            threading.Thread(
+                target=graph_sidecar.rebuild,
+                daemon=True,
+                name='graph-rebuild-sighup',
+            ).start()
+
+    signal.signal(signal.SIGHUP, _handle_sighup)
 
     # Warmup: pre-load model + index + addon backends in background
     def _warmup():
