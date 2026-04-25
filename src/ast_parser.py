@@ -632,7 +632,15 @@ def extract_typescript_imports(file_path: str) -> list[dict]:
             _parse_ts_require_expression(node, imports)
         elif node.type == 'lexical_declaration':
             _parse_ts_require_declaration(node, imports)
-    return imports
+
+    # Normalize to match Java/Kotlin/Python import dict format (import_name, import_type)
+    normalized = []
+    for imp in imports:
+        normalized.append({
+            'import_name': imp.get('source_module', imp.get('import_string', '')),
+            'import_type': imp.get('import_type', 'import'),
+        })
+    return normalized
 
 
 def _get_string_value(node) -> str | None:

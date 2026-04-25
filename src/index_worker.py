@@ -45,14 +45,16 @@ SOURCE_EXTENSIONS = {
 # Null SHA indicating a new branch
 NULL_SHA = '0' * 40
 
-# Model config (matches codebase-index.py)
-DEFAULT_MODEL = os.environ.get('MEMORY_EMBEDDING_MODEL', 'bge-base-en-v1.5')
+# Model config (matches codebase-index.py — CodeRankEmbed for codebase chunks)
+CODEBASE_EMBEDDING_MODEL = 'nomic-ai/CodeRankEmbed'
+DEFAULT_MODEL = os.environ.get('MEMORY_CODEBASE_MODEL', CODEBASE_EMBEDDING_MODEL)
 MODEL_DIMS = {
     'all-MiniLM-L6-v2': 384,
     'bge-small-en-v1.5': 384,
     'bge-base-en-v1.5': 768,
     'all-mpnet-base-v2': 768,
     'bge-large-en-v1.5': 1024,
+    'nomic-ai/CodeRankEmbed': 768,
 }
 MODEL_PREFIXES = {
     'bge-base-en-v1.5': 'BAAI/bge-base-en-v1.5',
@@ -67,6 +69,18 @@ WORKER_POLL_INTERVAL = int(os.environ.get('WORKER_POLL_INTERVAL', '5'))
 def content_hash(text: str) -> str:
     """SHA256 hash prefix for content dedup."""
     return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def _build_structural_prefix(file_path: str, title: str) -> str:
+    """Construct structural context prefix for embedding input.
+
+    Format: "{rel_path} | {title}\n"
+    """
+    if '/' in file_path:
+        rel_path = file_path.split('/', 1)[1] if ':' in file_path else file_path
+    else:
+        rel_path = file_path
+    return f'{rel_path} | {title}\n'
 
 
 def get_db() -> sqlite3.Connection:
@@ -85,6 +99,11 @@ def get_db() -> sqlite3.Connection:
             PRIMARY KEY (codebase, file_path)
         )
     ''')
+    # Add embedding_binary column if missing (for three-stage search)
+    try:
+        conn.execute('ALTER TABLE chunks ADD COLUMN embedding_binary BLOB')
+    except Exception:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -153,9 +172,13 @@ def embed_and_store_batch(
     if not chunks:
         return 0
 
-    from quantize import quantize as quant_fn
+    from quantize import quantize as quant_fn, quantize_binary
 
-    texts = [c['content'] for c in chunks]
+    # Prepend structural context prefix for embedding input (not stored in content)
+    texts = []
+    for c in chunks:
+        prefix = _build_structural_prefix(c['file_path'], c['title'])
+        texts.append(prefix + c['content'])
     embeddings = model.encode(texts, normalize_embeddings=True, batch_size=batch_size)
 
     count = 0
@@ -170,16 +193,19 @@ def embed_and_store_batch(
             dims = len(emb_arr)
             blob = struct.pack(f'{dims}f', *emb_arr.tolist())
 
+        # Binary embedding for three-stage search
+        binary_blob = quantize_binary(emb_arr.reshape(1, -1))[0].tobytes()
+
         conn.execute(
             'INSERT OR REPLACE INTO chunks '
             '(id, file_path, chunk_index, start_line, end_line, '
-            'title, content, embedding, hash, updated_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'title, content, embedding, embedding_binary, hash, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 chunk_id, chunk['file_path'], chunk['chunk_index'],
                 chunk['start_line'], chunk['end_line'],
                 chunk['title'], chunk['content'],
-                blob, c_hash, int(datetime.now().timestamp() * 1000),
+                blob, binary_blob, c_hash, int(datetime.now().timestamp() * 1000),
             ),
         )
 
