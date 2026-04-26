@@ -100,7 +100,7 @@ def load_model(model_name: str):
     from sentence_transformers import SentenceTransformer
     full_name = MODEL_PREFIXES.get(model_name, model_name)
     print(f'[codebase-index] Loading model: {full_name}', file=sys.stderr)
-    return SentenceTransformer(full_name)
+    return SentenceTransformer(full_name, trust_remote_code=True)
 
 
 def load_quantization_params(conn: sqlite3.Connection, model_name: str, dims: int):
