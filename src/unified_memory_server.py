@@ -290,6 +290,31 @@ class FlatSearchBackend:
                 computed_at INTEGER NOT NULL
             )
         ''')
+        # Add event_date column to chunks for temporal retrieval (idempotent)
+        try:
+            self._conn.execute('ALTER TABLE chunks ADD COLUMN event_date TEXT')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_chunks_event_date
+            ON chunks(event_date)
+        ''')
+        # Entity extraction table for entity-overlap retrieval
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS chunk_entities (
+                chunk_id TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_value TEXT NOT NULL
+            )
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_chunk_entities_value
+            ON chunk_entities(entity_value)
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_chunk_entities_chunk
+            ON chunk_entities(chunk_id)
+        ''')
         self._conn.execute('ANALYZE')
         self._conn.commit()
 
@@ -503,14 +528,20 @@ class FlatSearchBackend:
         except Exception:
             pass
 
-        # Delete old chunks for this file
+        # Delete old chunks and associated entities for this file
         old_rows = conn.execute(
-            'SELECT rowid FROM chunks WHERE file_path = ?', (file_path_relative,)
+            'SELECT rowid, id FROM chunks WHERE file_path = ?', (file_path_relative,)
         ).fetchall()
         for row in old_rows:
             try:
                 conn.execute(
                     'DELETE FROM chunks_fts WHERE rowid = ?', (row['rowid'],)
+                )
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    'DELETE FROM chunk_entities WHERE chunk_id = ?', (row['id'],)
                 )
             except Exception:
                 pass
@@ -525,15 +556,21 @@ class FlatSearchBackend:
             chunk_id = f'{file_path_relative}:{i}'
             content_hash = hashlib.sha256(chunk['content'].encode()).hexdigest()[:16]
 
+            # Extract event_date for temporal retrieval
+            event_date = extract_event_date(
+                chunk['content'], session_ts=None, file_path=file_path_relative,
+            )
+
             conn.execute(
                 'INSERT INTO chunks (id, file_path, chunk_index, start_line, '
-                'end_line, title, content, embedding, hash, updated_at) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)',
+                'end_line, title, content, embedding, hash, updated_at, event_date) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)',
                 (
                     chunk_id, file_path_relative, i,
                     chunk['start_line'], chunk['end_line'],
                     chunk['title'], chunk['content'],
                     content_hash, int(datetime.now().timestamp() * 1000),
+                    event_date,
                 ),
             )
 
@@ -549,6 +586,15 @@ class FlatSearchBackend:
                     )
                 except Exception:
                     pass
+
+            # Extract and store entities for entity-overlap retrieval
+            entities = extract_entities(chunk['content'], chunk['title'])
+            for etype, evalue in entities:
+                conn.execute(
+                    'INSERT INTO chunk_entities (chunk_id, entity_type, entity_value) '
+                    'VALUES (?, ?, ?)',
+                    (chunk_id, etype, evalue),
+                )
 
         # Update files table (preserve existing summary)
         file_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
@@ -1649,6 +1695,173 @@ def date_from_path(fp: str) -> Optional[str]:
     """Extract YYYY-MM-DD date from a file path."""
     m = re.search(r'(\d{4}-\d{2}-\d{2})', fp)
     return m.group(1) if m else None
+
+
+# Regex for ISO dates (2025-01-15) and English dates (January 15, 2025)
+_ISO_DATE_RE = re.compile(r'\b(\d{4}-\d{2}-\d{2})\b')
+_ENGLISH_DATE_RE = re.compile(
+    r'\b((?:January|February|March|April|May|June|July|August|September|'
+    r'October|November|December)\s+\d{1,2},?\s+\d{4})\b',
+    re.IGNORECASE,
+)
+_RELATIVE_DATE_WORDS = re.compile(
+    r'\b(yesterday|last\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)'
+    r'|today|this\s+(?:week|month))\b',
+    re.IGNORECASE,
+)
+
+
+def extract_event_date(
+    content: str,
+    session_ts: str | None = None,
+    file_path: str = '',
+) -> str | None:
+    """Extract the most relevant event date from content/metadata.
+
+    Priority:
+      1. Session timestamp from JSONL metadata
+      2. Date embedded in file_path (via date_from_path)
+      3. ISO date found in content (YYYY-MM-DD)
+      4. English date in content (January 15, 2025)
+      5. Relative date expressions ("yesterday", "last week") anchored to session_ts
+
+    Returns YYYY-MM-DD string or None.
+    """
+    # Priority 1: session timestamp
+    if session_ts:
+        try:
+            # session_ts may be ISO format or epoch millis
+            if session_ts.replace('.', '').isdigit():
+                ts = float(session_ts)
+                if ts > 1e12:
+                    ts /= 1000
+                return datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
+            else:
+                return session_ts[:10]  # ISO format: take YYYY-MM-DD prefix
+        except (ValueError, OSError):
+            pass
+
+    # Priority 2: date from file path
+    path_date = date_from_path(file_path)
+    if path_date:
+        return path_date
+
+    # Priority 3: ISO date in content
+    m = _ISO_DATE_RE.search(content)
+    if m:
+        return m.group(1)
+
+    # Priority 4: English date in content
+    m = _ENGLISH_DATE_RE.search(content)
+    if m:
+        try:
+            from dateparser import parse as dp_parse
+            parsed = dp_parse(m.group(1))
+            if parsed:
+                return parsed.strftime('%Y-%m-%d')
+        except ImportError:
+            pass
+
+    # Priority 5: relative date expressions
+    m = _RELATIVE_DATE_WORDS.search(content)
+    if m:
+        try:
+            from dateparser import parse as dp_parse
+            anchor = None
+            if session_ts:
+                try:
+                    if session_ts.replace('.', '').isdigit():
+                        ts = float(session_ts)
+                        if ts > 1e12:
+                            ts /= 1000
+                        anchor = datetime.fromtimestamp(ts)
+                    else:
+                        anchor = datetime.fromisoformat(session_ts[:19])
+                except (ValueError, OSError):
+                    pass
+            settings: dict = {}
+            if anchor:
+                settings['RELATIVE_BASE'] = anchor
+            parsed = dp_parse(m.group(1), settings=settings)
+            if parsed:
+                return parsed.strftime('%Y-%m-%d')
+        except ImportError:
+            pass
+
+    return None
+
+
+# Known tools/services for entity extraction
+KNOWN_TOOLS = {
+    'claude', 'slack', 'jira', 'github', 'datadog', 'splunk', 'sourcegraph',
+    'grafana', 'terraform', 'docker', 'kubernetes', 'aws', 'gcp', 'azure',
+    'redis', 'postgres', 'postgresql', 'mysql', 'mongodb', 'dynamodb',
+    'elasticsearch', 'kibana', 'jenkins', 'circleci', 'buildkite',
+    'confluence', 'notion', 'linear', 'figma', 'vercel', 'netlify',
+    'heroku', 'flyio', 'render', 'supabase', 'firebase', 'stripe',
+    'twilio', 'sendgrid', 'openai', 'anthropic', 'bedrock', 'sagemaker',
+    'databricks', 'snowflake', 'bigquery', 'airflow', 'dagster', 'dbt',
+    'spark', 'kafka', 'rabbitmq', 'nginx', 'caddy', 'traefik',
+    'python', 'typescript', 'javascript', 'rust', 'golang', 'java',
+    'ruby', 'react', 'nextjs', 'django', 'flask', 'fastapi', 'rails',
+    'springboot', 'zeppelin', 'datahub', 'artifactory', 'gradle', 'maven',
+    'npm', 'yarn', 'pnpm', 'pip', 'poetry', 'conda',
+}
+
+# Stop words for person name detection (common capitalized non-name words)
+_NAME_STOP = {
+    'the', 'this', 'that', 'with', 'from', 'into', 'have', 'been', 'will',
+    'when', 'what', 'where', 'which', 'there', 'their', 'these', 'those',
+    'about', 'after', 'before', 'between', 'could', 'would', 'should',
+    'also', 'just', 'then', 'than', 'some', 'other', 'more', 'most',
+    'only', 'very', 'each', 'every', 'both', 'either', 'neither',
+    'here', 'over', 'under', 'again', 'once', 'much', 'many',
+    'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
+    'sunday', 'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december',
+    'todo', 'note', 'update', 'error', 'warning', 'info', 'debug',
+    'test', 'tests', 'testing', 'setup', 'config', 'step',
+}
+
+_PERSON_RE = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+))\b')
+
+
+def extract_entities(content: str, title: str) -> list[tuple[str, str]]:
+    """Extract entities from chunk content and title.
+
+    Returns list of (entity_type, entity_value) tuples.
+    Types: 'tool', 'project', 'person'.
+    """
+    entities: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(etype: str, evalue: str) -> None:
+        key = (etype, evalue.lower())
+        if key not in seen:
+            seen.add(key)
+            entities.append((etype, evalue.lower()))
+
+    combined = f'{title} {content}'.lower()
+    words = set(re.findall(r'\b\w+\b', combined))
+
+    # Tool matching: case-insensitive word boundary
+    for tool in KNOWN_TOOLS:
+        if tool in words:
+            _add('tool', tool)
+
+    # Project name from title metadata
+    meta = parse_chunk_title(title)
+    if meta.get('project'):
+        _add('project', meta['project'])
+
+    # Person names: capitalized bigrams not in stop list
+    for m in _PERSON_RE.finditer(content):
+        name = m.group(1)
+        parts = name.split()
+        if all(p.lower() not in _NAME_STOP and p.lower() not in KNOWN_TOOLS for p in parts):
+            _add('person', name)
+
+    return entities
 
 
 def smart_truncate(text: str, max_len: int = 800) -> str:

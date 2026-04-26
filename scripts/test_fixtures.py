@@ -64,6 +64,26 @@ def create_test_db(
         )
     ''')
 
+    # --- Multi-signal retrieval tables ---
+    # event_date column on chunks (added via ALTER in production)
+    # Already included in CREATE TABLE above if we add it there; for test
+    # compatibility, add via ALTER which is idempotent in test setup
+    try:
+        conn.execute('ALTER TABLE chunks ADD COLUMN event_date TEXT')
+    except sqlite3.OperationalError:
+        pass
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_chunks_event_date ON chunks(event_date)')
+
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS chunk_entities (
+            chunk_id TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_value TEXT NOT NULL
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_chunk_entities_value ON chunk_entities(entity_value)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_chunk_entities_chunk ON chunk_entities(chunk_id)')
+
     # --- Dependency tables (from _ensure_dep_tables) ---
     conn.execute('''
         CREATE TABLE IF NOT EXISTS edges (

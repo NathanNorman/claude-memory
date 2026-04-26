@@ -87,5 +87,94 @@ class TestMergeRRFMulti(unittest.TestCase):
         self.assertAlmostEqual(merged[1]['score'], 1/62)
 
 
+class TestExtractEventDate(unittest.TestCase):
+    """Tests for extract_event_date()."""
+
+    def _extract(self, content='', session_ts=None, file_path=''):
+        from unified_memory_server import extract_event_date
+        return extract_event_date(content, session_ts, file_path)
+
+    def test_session_timestamp_iso(self):
+        result = self._extract(session_ts='2025-03-15T10:30:00Z')
+        self.assertEqual(result, '2025-03-15')
+
+    def test_session_timestamp_epoch_millis(self):
+        # 2025-01-15 00:00:00 UTC = 1736899200000 ms
+        result = self._extract(session_ts='1736899200000')
+        self.assertIsNotNone(result)
+        self.assertTrue(result.startswith('2025-01'))
+
+    def test_file_path_date(self):
+        result = self._extract(file_path='memory/2025-06-20.md')
+        self.assertEqual(result, '2025-06-20')
+
+    def test_iso_date_in_content(self):
+        result = self._extract(content='We deployed on 2025-04-10 and it worked.')
+        self.assertEqual(result, '2025-04-10')
+
+    def test_english_date_in_content(self):
+        result = self._extract(content='The meeting was on January 15, 2025.')
+        self.assertEqual(result, '2025-01-15')
+
+    def test_relative_date_yesterday(self):
+        result = self._extract(
+            content='I fixed the bug yesterday',
+            session_ts='2025-06-10T12:00:00',
+        )
+        self.assertEqual(result, '2025-06-10')  # session_ts takes priority 1
+
+    def test_no_date_returns_none(self):
+        result = self._extract(content='No date information here at all.')
+        self.assertIsNone(result)
+
+    def test_priority_order_session_over_path(self):
+        """Session timestamp should win over file path date."""
+        result = self._extract(
+            session_ts='2025-08-01T00:00:00',
+            file_path='memory/2025-01-01.md',
+        )
+        self.assertEqual(result, '2025-08-01')
+
+
+class TestExtractEntities(unittest.TestCase):
+    """Tests for extract_entities()."""
+
+    def _extract(self, content='', title=''):
+        from unified_memory_server import extract_entities
+        return extract_entities(content, title)
+
+    def test_tool_extraction(self):
+        entities = self._extract(content='We use Slack and Jira for communication.')
+        types_vals = {(e, v) for e, v in entities}
+        self.assertIn(('tool', 'slack'), types_vals)
+        self.assertIn(('tool', 'jira'), types_vals)
+
+    def test_project_from_title(self):
+        entities = self._extract(title='toast-analytics | 2025-01-15 | Tools: Read, Write')
+        types_vals = {(e, v) for e, v in entities}
+        self.assertIn(('project', 'toast-analytics'), types_vals)
+
+    def test_person_name_pattern(self):
+        entities = self._extract(content='Talked with Nathan Norman about the deployment.')
+        types_vals = {(e, v) for e, v in entities}
+        self.assertIn(('person', 'nathan norman'), types_vals)
+
+    def test_no_entities(self):
+        entities = self._extract(content='just some plain text with no names or tools')
+        self.assertEqual(entities, [])
+
+    def test_tool_case_insensitive(self):
+        entities = self._extract(content='GITHUB and Docker are useful')
+        tools = [v for e, v in entities if e == 'tool']
+        self.assertIn('github', tools)
+        self.assertIn('docker', tools)
+
+    def test_stop_words_not_persons(self):
+        """Capitalized stop words should not be detected as person names."""
+        entities = self._extract(content='Monday Tuesday and other dates')
+        persons = [v for e, v in entities if e == 'person']
+        self.assertEqual(persons, [])
+
+
 if __name__ == '__main__':
     unittest.main()
