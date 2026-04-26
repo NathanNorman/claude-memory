@@ -1669,21 +1669,23 @@ class GraphSidecar:
                 edge_attrs['metadata'].append(row['metadata'])
 
             node_list = sorted(node_set)
-            self._node_index = {name: idx for idx, name in enumerate(node_list)}
+            new_index = {name: idx for idx, name in enumerate(node_list)}
 
             g = ig.Graph(directed=True)
             g.add_vertices(len(node_list))
             g.vs['name'] = node_list
 
             indexed_edges = [
-                (self._node_index[src], self._node_index[tgt])
+                (new_index[src], new_index[tgt])
                 for src, tgt in edge_list
             ]
             g.add_edges(indexed_edges)
             g.es['edge_type'] = edge_attrs['edge_type']
             g.es['metadata'] = edge_attrs['metadata']
 
-            self._graph = g
+            # Atomic swap: update graph and index together to avoid
+            # race condition with concurrent readers during rebuild
+            self._graph, self._node_index = g, new_index
             self._edge_count_at_load = total_edges
             self._loaded = True
             self._load_time = time.time() - t0
