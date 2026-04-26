@@ -47,7 +47,7 @@ unified-mcp-launcher.sh
     └── RRF merge            — Reciprocal Rank Fusion (k=60) combines both result sets
 ```
 
-Four MCP tools: `memory_search`, `memory_read`, `memory_write`, `get_status`.
+MCP tools: `memory_search`, `memory_deep_search`, `memory_read`, `memory_write`, `get_status`, `codebase_search`, `dependency_search`, `symbol_search`, `graph_traverse`, `community_search`, `entity_browse`, `entity_graph`, `index_session`.
 
 On `memory_write`: content is written to disk, chunked and indexed into FTS5, then embedded via `sentence-transformers` (all-MiniLM-L6-v2) and stored as BLOBs — all synchronously. Written memories are searchable via both backends immediately.
 
@@ -86,6 +86,8 @@ Not in this repo — runtime data only:
 - `chunks_vec` — vec0 virtual table (embedding float[384]) — written by Node.js indexer
 - `embedding_cache` — keyed by (provider, model, hash) → embedding BLOB
 - `meta` — tracks embedding model version for invalidation
+- `entity_relationships` — co-occurrence graph (entity_a, relation_type, entity_b, chunk_id, confidence)
+- `quantization_meta` — TurboQuant parameters (model_name, dims, bit_width, rotation_seed, codebook)
 
 sqlite-vec requires `BigInt` for rowid values in vec0 operations.
 
@@ -155,6 +157,53 @@ Standalone Python utilities, not part of the MCP server or Node.js indexer:
 - **Exchange-aware chunking**: Conversation archives are chunked at exchange boundaries — user/assistant pairs are never split across chunks.
 - **Embedding cache**: Table `embedding_cache` avoids re-embedding unchanged content across reindexes.
 - **Mtime-based staleness**: `isIndexStale()` compares file mtimes against DB timestamps — O(file count) not O(DB size).
+- **Multi-hop retrieval**: `memory_deep_search` MCP tool runs 2-pass search — Pass 1 uses standard hybrid search, Pass 2 extracts new entities from top results and searches again with entity+keyword only (no vector/temporal — saves ~500ms). Results merged via RRF and deduplicated.
+- **Entity relationship graph**: `entity_relationships` table stores co-occurrence pairs (canonical ordering). `entity_browse` lists entities with counts; `entity_graph` explores co-occurrence neighborhoods at depth 1-2.
+- **Cross-repo dependency graph**: `cross_repo_deps.py` parses Gradle/Maven/npm/pip build files into `repo_dependency` edges. `dependency_search` supports `repo_depends_on` and `repo_depended_on_by` directions.
+- **TurboQuant sidecar backend**: `TurboQuantBackend` loads pre-built sidecar files for 3-stage search (binary Hamming → 4-bit dot products → float32 mmap rerank). Selected via `VECTOR_BACKEND=turboquant` env var or auto-detected from sidecar files.
+
+### TurboQuant sidecar backend
+
+```bash
+# Generate sidecar files from existing embeddings (without modifying DB)
+source ~/.claude-memory/graphiti-venv/bin/activate
+python3 scripts/migrate_to_quantized.py --sidecar-only
+
+# Or generate alongside normal DB migration
+python3 scripts/migrate_to_quantized.py --sidecar
+
+# Files written to ~/.claude-memory/index/:
+# - packed_vectors.bin: concatenated 4-bit packed vectors
+# - rerank_matrix.f32: float32 matrix for exact reranking (mmap'd)
+# - quantization.json: metadata (codebook, rotation_seed, dims, rowid_map)
+```
+
+**Env vars:**
+- `VECTOR_BACKEND`: `float32` (default) or `turboquant`. Auto-detects sidecar files if present.
+- Falls back to float32 `VectorSearchBackend` if sidecar files missing or search fails.
+
+### Cross-repo dependency indexing
+
+```bash
+# Index repo dependencies
+python3 scripts/cross_repo_deps.py --path ~/my-repo --name my-repo
+
+# Incremental update (skip unchanged build files)
+python3 scripts/cross_repo_deps.py --path ~/my-repo --name my-repo --update
+
+# List indexed repos
+python3 scripts/cross_repo_deps.py --list
+
+# Remove a repo's dependency edges
+python3 scripts/cross_repo_deps.py --remove --name my-repo
+```
+
+### Entity relationship backfill
+
+```bash
+# Backfill entity_relationships from existing chunk_entities
+python3 scripts/backfill_entity_relationships.py
+```
 
 ## Concurrency
 

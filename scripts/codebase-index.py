@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import hashlib
+import json
 import os
 import sqlite3
 import struct
@@ -37,14 +38,24 @@ SOURCE_EXTENSIONS = {
     '.py', '.java', '.kt', '.scala', '.sh', '.sql', '.js', '.ts', '.tf', '.md',
 }
 
-# Model config (matches unified_memory_server.py defaults)
-DEFAULT_MODEL = os.environ.get('MEMORY_EMBEDDING_MODEL', 'bge-base-en-v1.5')
+# Model config — dual-model architecture
+# nomic-embed-text-v1.5 for codebase (MRL-capable, Matryoshka), bge-base for memory
+CODEBASE_EMBEDDING_MODEL = 'nomic-ai/nomic-embed-text-v1.5'
+CODEBASE_DOC_PREFIX = 'search_document: '
+CODEBASE_QUERY_PREFIX = 'search_query: '
+MEMORY_EMBEDDING_MODEL = 'BAAI/bge-base-en-v1.5'
+DEFAULT_MODEL = os.environ.get('MEMORY_CODEBASE_MODEL', CODEBASE_EMBEDDING_MODEL)
+# Valid Matryoshka dimensions for nomic-embed-text-v1.5
+MATRYOSHKA_DIMS = {64, 128, 256, 384, 512, 768}
+DEFAULT_TRUNCATE_DIMS = 256
 MODEL_DIMS = {
     'all-MiniLM-L6-v2': 384,
     'bge-small-en-v1.5': 384,
     'bge-base-en-v1.5': 768,
     'all-mpnet-base-v2': 768,
     'bge-large-en-v1.5': 1024,
+    'nomic-ai/CodeRankEmbed': 768,
+    'nomic-ai/nomic-embed-text-v1.5': 768,
 }
 MODEL_PREFIXES = {
     'bge-base-en-v1.5': 'BAAI/bge-base-en-v1.5',
@@ -76,6 +87,11 @@ def get_db() -> sqlite3.Connection:
             PRIMARY KEY (codebase, file_path)
         )
     ''')
+    # Add binary embedding column (nullable, metadata-only in SQLite)
+    try:
+        conn.execute('ALTER TABLE chunks ADD COLUMN embedding_binary BLOB')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -111,6 +127,71 @@ def load_quantization_params(conn: sqlite3.Connection, model_name: str, dims: in
         return None, None
 
 
+def build_structural_prefix(file_path: str, title: str) -> str:
+    """Construct structural context prefix for embedding input.
+
+    Format: "{rel_path} | {title}\n"
+    The file_path is expected to be like "codebase:name/rel/path.py" —
+    we strip the "codebase:name/" prefix to get the relative path.
+    """
+    # Strip "codebase:<name>/" prefix to get relative path
+    if '/' in file_path:
+        rel_path = file_path.split('/', 1)[1] if ':' in file_path else file_path
+    else:
+        rel_path = file_path
+    return f'{rel_path} | {title}\n'
+
+
+def check_codebase_model(conn: sqlite3.Connection, model_name: str) -> bool:
+    """Check if codebase model matches meta table. Returns True if reindex needed."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'codebase_embedding_model'"
+        ).fetchone()
+        if row:
+            stored_model = row['value']
+            if stored_model != model_name:
+                print(
+                    f'[codebase-index] Model changed: {stored_model} -> {model_name}. '
+                    f'Full reindex required.',
+                    file=sys.stderr,
+                )
+                return True
+        return False
+    except Exception:
+        # meta table may not exist yet
+        return False
+
+
+def purge_all_codebase_chunks(conn: sqlite3.Connection) -> None:
+    """Purge all codebase chunks and metadata for a fresh reindex."""
+    print('[codebase-index] Purging all codebase chunks for model migration...', file=sys.stderr)
+    # Delete FTS entries for codebase chunks
+    try:
+        conn.execute(
+            "DELETE FROM chunks_fts WHERE rowid IN "
+            "(SELECT rowid FROM chunks WHERE file_path LIKE 'codebase:%')"
+        )
+    except Exception:
+        pass
+    conn.execute("DELETE FROM chunks WHERE file_path LIKE 'codebase:%'")
+    conn.execute('DELETE FROM codebase_meta')
+    conn.commit()
+    print('[codebase-index] Purge complete.', file=sys.stderr)
+
+
+def write_codebase_model_meta(conn: sqlite3.Connection, model_name: str) -> None:
+    """Write the codebase embedding model name to the meta table."""
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('codebase_embedding_model', ?)",
+            (model_name,),
+        )
+        conn.commit()
+    except Exception as e:
+        print(f'[codebase-index] Warning: could not write codebase model meta: {e}', file=sys.stderr)
+
+
 def discover_files(repo_path: Path) -> list[Path]:
     """Use git ls-files to discover source files, respecting .gitignore."""
     result = subprocess.run(
@@ -138,14 +219,29 @@ def embed_and_store_batch(
     rotate_fn,
     codebook,
     batch_size: int = 32,
+    truncate_dims: int = 0,
+    doc_prefix: str = '',
 ) -> int:
-    """Embed a batch of chunks and store in the database."""
+    """Embed a batch of chunks and store in the database.
+
+    Args:
+        truncate_dims: If > 0, truncate embeddings to this dimension and L2-renormalize
+                       (Matryoshka Representation Learning).
+        doc_prefix: Prefix to prepend to document text for asymmetric embedding models.
+    """
     if not chunks:
         return 0
 
-    from quantize import quantize as quant_fn
+    from quantize import quantize as quant_fn, quantize_binary
 
-    texts = [c['content'] for c in chunks]
+    # Prepend structural context prefix for embedding input only (not stored content)
+    texts = []
+    for c in chunks:
+        prefix = build_structural_prefix(c['file_path'], c['title'])
+        text = prefix + c['content']
+        if doc_prefix:
+            text = doc_prefix + text
+        texts.append(text)
     embeddings = model.encode(texts, normalize_embeddings=True, batch_size=batch_size)
 
     count = 0
@@ -154,6 +250,17 @@ def embed_and_store_batch(
         c_hash = content_hash(chunk['content'])
 
         emb_arr = np.array(emb, dtype=np.float32)
+
+        # Matryoshka truncation: truncate to target dims and L2-renormalize
+        if truncate_dims > 0 and len(emb_arr) > truncate_dims:
+            emb_arr = emb_arr[:truncate_dims]
+            norm = np.linalg.norm(emb_arr)
+            if norm > 0:
+                emb_arr = emb_arr / norm
+
+        # Binary embedding from unrotated normalized vector
+        binary_blob = bytes(quantize_binary(emb_arr.reshape(1, -1))[0])
+
         if rotate_fn is not None and codebook is not None:
             blob = quant_fn(emb_arr, rotate_fn, codebook)
         else:
@@ -163,13 +270,13 @@ def embed_and_store_batch(
         conn.execute(
             'INSERT OR REPLACE INTO chunks '
             '(id, file_path, chunk_index, start_line, end_line, '
-            'title, content, embedding, hash, updated_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'title, content, embedding, embedding_binary, hash, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 chunk_id, chunk['file_path'], chunk['chunk_index'],
                 chunk['start_line'], chunk['end_line'],
                 chunk['title'], chunk['content'],
-                blob, c_hash, int(datetime.now().timestamp() * 1000),
+                blob, binary_blob, c_hash, int(datetime.now().timestamp() * 1000),
             ),
         )
 
@@ -203,6 +310,8 @@ def index_codebase(
     name: str,
     repo_path: Path,
     incremental: bool = False,
+    truncate_dims: int = 0,
+    doc_prefix: str = '',
 ) -> dict:
     """Index a codebase into the chunks table."""
     from code_chunker import chunk_file
@@ -288,7 +397,7 @@ def index_codebase(
 
         # Embed in batches
         if len(batch) >= batch_size:
-            stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
+            stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook, truncate_dims=truncate_dims, doc_prefix=doc_prefix)
             total_chunks += stored
             conn.commit()
             batch = []
@@ -301,7 +410,8 @@ def index_codebase(
 
     # Flush remaining batch
     if batch:
-        stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook)
+        stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook,
+                                       truncate_dims=truncate_dims, doc_prefix=doc_prefix)
         total_chunks += stored
 
     # Remove chunks for deleted files (incremental mode)
@@ -416,11 +526,21 @@ def ensure_dep_tables(conn: sqlite3.Connection) -> None:
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name, codebase)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path, codebase)')
+    # Add confidence column to edges table (idempotent migration)
+    try:
+        conn.execute('ALTER TABLE edges ADD COLUMN confidence REAL')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    # Add metadata column to symbols table for LLM labels (idempotent migration)
+    try:
+        conn.execute('ALTER TABLE symbols ADD COLUMN metadata TEXT')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
 
 
 # Extensions that support dependency extraction
-DEP_EXTENSIONS = {'.java', '.kt', '.py'}
+DEP_EXTENSIONS = {'.java', '.kt', '.py', '.ts'}
 
 
 def index_dependencies(
@@ -429,8 +549,8 @@ def index_dependencies(
     repo_path: Path,
     incremental: bool = False,
 ) -> dict:
-    """Extract imports and symbols from source files and store as edges/symbols."""
-    from ast_parser import extract_imports, extract_symbols
+    """Extract imports, symbols, and type hierarchy from source files and store as edges/symbols."""
+    from ast_parser import extract_imports, extract_symbols, extract_hierarchy
     from import_resolver import resolve_import, clear_cache
 
     clear_cache()
@@ -473,7 +593,7 @@ def index_dependencies(
             continue
 
         # Determine language from extension
-        lang = {'java': 'java', 'kt': 'kotlin', 'py': 'python'}.get(fpath.suffix.lstrip('.'))
+        lang = {'java': 'java', 'kt': 'kotlin', 'py': 'python', 'ts': 'typescript'}.get(fpath.suffix.lstrip('.'))
         if not lang:
             continue
 
@@ -513,6 +633,34 @@ def index_dependencies(
             )
             total_symbols += 1
 
+        # Extract type hierarchy (extends/implements/delegation)
+        try:
+            source_code = fpath.read_text(errors='replace')
+            hierarchy = extract_hierarchy(str(fpath), source_code, lang)
+        except Exception as e:
+            print(f'[deps] Hierarchy parse failed {rel}: {e}', file=sys.stderr)
+            hierarchy = []
+
+        # Build import map for parent name resolution: simple_name -> FQN
+        import_map: dict[str, str] = {}
+        for imp in imports:
+            fqn = imp['import_name']
+            if not fqn.endswith('.*'):
+                simple = fqn.rsplit('.', 1)[-1]
+                import_map[simple] = fqn
+
+        for hier in hierarchy:
+            parent = hier['parent_name']
+            # Try to resolve parent via import map
+            parent_fqn = import_map.get(parent, parent)
+            target = resolve_import(parent_fqn, repo_str, lang)
+            conn.execute(
+                'INSERT INTO edges (codebase, source_file, target_file, edge_type, metadata, updated_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (name, rel, target, hier['relationship_type'], parent, now_ts),
+            )
+            total_edges += 1
+
         total_files += 1
 
         if total_files % 100 == 0:
@@ -538,6 +686,492 @@ def index_dependencies(
     }
 
 
+def build_symbol_table(conn: sqlite3.Connection, codebase_name: str) -> dict[str, list[dict]]:
+    """Load all symbols from the DB into the dict format the resolver expects.
+
+    Returns: dict mapping symbol name -> list of {file_path, kind, start_line, end_line}
+    """
+    rows = conn.execute(
+        'SELECT name, file_path, kind, start_line, end_line FROM symbols WHERE codebase = ?',
+        (codebase_name,),
+    ).fetchall()
+
+    table: dict[str, list[dict]] = {}
+    for r in rows:
+        entry = {
+            'file_path': r['file_path'],
+            'kind': r['kind'],
+            'start_line': r['start_line'],
+            'end_line': r['end_line'],
+        }
+        table.setdefault(r['name'], []).append(entry)
+    return table
+
+
+def build_import_map(conn: sqlite3.Connection, codebase_name: str) -> dict[tuple[str, str], str]:
+    """Load import edges and build (file_path, imported_name) -> target_file mapping.
+
+    Only includes resolved imports (target_file IS NOT NULL).
+    """
+    rows = conn.execute(
+        "SELECT source_file, target_file, metadata FROM edges "
+        "WHERE codebase = ? AND edge_type IN ('import', 'static_import', 'wildcard_import') "
+        "AND target_file IS NOT NULL",
+        (codebase_name,),
+    ).fetchall()
+
+    imap: dict[tuple[str, str], str] = {}
+    for r in rows:
+        source = r['source_file']
+        target = r['target_file']
+        imported_name = r['metadata']  # metadata stores the import_name string
+        if imported_name:
+            # Store full import name
+            imap[(source, imported_name)] = target
+            # Also store just the last component (class/function name)
+            short_name = imported_name.rsplit('.', 1)[-1]
+            if short_name != '*':
+                imap[(source, short_name)] = target
+    return imap
+
+
+def index_call_graph(
+    conn: sqlite3.Connection,
+    name: str,
+    repo_path: Path,
+    incremental: bool = False,
+) -> dict:
+    """Extract call sites and resolve them to target symbols.
+
+    Orchestrates: extract call sites per file, run resolution cascade, store edges.
+    """
+    from ast_parser import extract_call_sites, extract_symbols
+    from call_resolver import resolve_call_targets
+
+    ensure_dep_tables(conn)
+
+    files = discover_files(repo_path)
+    dep_files = [f for f in files if f.suffix in DEP_EXTENSIONS]
+
+    if not dep_files:
+        return {'error': 'No parseable source files found'}
+
+    # Load existing hashes for incremental mode
+    existing_hashes: dict[str, str] = {}
+    if incremental:
+        rows = conn.execute(
+            'SELECT file_path, content_hash FROM codebase_meta WHERE codebase = ?',
+            (name,),
+        ).fetchall()
+        existing_hashes = {r['file_path']: r['content_hash'] for r in rows}
+
+    # Build symbol table and import map from DB
+    print('[calls] Building symbol table and import map...', file=sys.stderr)
+    symbol_table = build_symbol_table(conn, name)
+    import_map = build_import_map(conn, name)
+    print(f'[calls] {len(symbol_table)} symbols, {len(import_map)} import mappings', file=sys.stderr)
+
+    now_ts = int(time.time())
+    total_calls = 0
+    total_resolved = 0
+    total_unresolved = 0
+    total_files = 0
+    skipped = 0
+    t0 = time.time()
+
+    all_call_sites: list[dict] = []
+    lang_map = {'java': 'java', 'kt': 'kotlin', 'py': 'python'}
+
+    for i, fpath in enumerate(dep_files):
+        rel = str(fpath.relative_to(repo_path))
+
+        # Compute hash and skip unchanged in incremental mode
+        try:
+            fhash = file_hash(fpath)
+        except Exception:
+            continue
+
+        if incremental and existing_hashes.get(rel) == fhash:
+            skipped += 1
+            continue
+
+        lang = lang_map.get(fpath.suffix.lstrip('.'))
+        if not lang:
+            continue
+
+        # Delete old call edges for this file
+        conn.execute(
+            "DELETE FROM edges WHERE source_file = ? AND codebase = ? AND edge_type IN ('calls', 'calls_unresolved')",
+            (rel, name),
+        )
+
+        # Extract symbols for this file (for caller identification)
+        try:
+            syms = extract_symbols(str(fpath))
+        except Exception:
+            syms = []
+
+        # Read source and extract call sites
+        try:
+            source_code = fpath.read_bytes() if lang in ('java', 'kotlin') else fpath.read_text(errors='replace')
+            calls = extract_call_sites(str(fpath), source_code, lang, syms)
+        except Exception as e:
+            print(f'[calls] Extraction failed {rel}: {e}', file=sys.stderr)
+            calls = []
+
+        # Normalize file_path in call sites to relative path
+        for call in calls:
+            call['file_path'] = rel
+
+        all_call_sites.extend(calls)
+        total_files += 1
+
+        if total_files % 100 == 0:
+            elapsed = time.time() - t0
+            print(
+                f'\r[calls] {total_files}/{len(dep_files)} files, '
+                f'{len(all_call_sites)} call sites, {elapsed:.1f}s',
+                end='', file=sys.stderr,
+            )
+
+    # Run resolution cascade on all collected call sites
+    print(f'\n[calls] Resolving {len(all_call_sites)} call sites...', file=sys.stderr)
+    resolved_edges = resolve_call_targets(all_call_sites, symbol_table, import_map)
+
+    # Store edges
+    for edge in resolved_edges:
+        metadata_json = json.dumps(edge['metadata'])
+        conn.execute(
+            'INSERT INTO edges (codebase, source_file, target_file, edge_type, metadata, confidence, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (name, edge['source_file'], edge['target_file'], edge['edge_type'],
+             metadata_json, edge['confidence'], now_ts),
+        )
+        total_calls += 1
+        if edge['edge_type'] == 'calls':
+            total_resolved += 1
+        else:
+            total_unresolved += 1
+
+    conn.commit()
+    elapsed = time.time() - t0
+    print(f'[calls] Done: {total_files} files, {total_calls} call edges '
+          f'({total_resolved} resolved, {total_unresolved} unresolved), '
+          f'{skipped} skipped, {elapsed:.1f}s', file=sys.stderr)
+
+    return {
+        'files_processed': total_files,
+        'call_edges': total_calls,
+        'resolved': total_resolved,
+        'unresolved': total_unresolved,
+        'files_skipped': skipped,
+        'elapsed_seconds': round(elapsed, 1),
+    }
+
+
+def resolve_hierarchy_edges(conn: sqlite3.Connection) -> dict:
+    """Resolve unresolved hierarchy edges by matching parent names against the symbols table.
+
+    Queries hierarchy edges (extends/implements/delegation) where target_file IS NULL,
+    then looks up the parent name in metadata against symbols across all codebases.
+    Updates target_file for matches found.
+    """
+    ensure_dep_tables(conn)
+
+    # Find unresolved hierarchy edges
+    unresolved = conn.execute(
+        'SELECT id, metadata, codebase FROM edges '
+        'WHERE target_file IS NULL AND edge_type IN (?, ?, ?)',
+        ('extends', 'implements', 'delegation'),
+    ).fetchall()
+
+    if not unresolved:
+        print('[resolve-hierarchy] No unresolved hierarchy edges found.', file=sys.stderr)
+        return {'resolved': 0, 'unresolved': 0}
+
+    resolved = 0
+    still_unresolved = 0
+
+    for row in unresolved:
+        parent_name = row['metadata']
+        edge_id = row['id']
+
+        # Look up parent name in symbols table across all codebases
+        sym = conn.execute(
+            'SELECT file_path, codebase FROM symbols WHERE name = ? LIMIT 1',
+            (parent_name,),
+        ).fetchone()
+
+        if sym:
+            # Construct the full path as codebase:file_path
+            target = f"codebase:{sym['codebase']}/{sym['file_path']}"
+            conn.execute(
+                'UPDATE edges SET target_file = ? WHERE id = ?',
+                (target, edge_id),
+            )
+            resolved += 1
+        else:
+            still_unresolved += 1
+
+    conn.commit()
+    print(f'[resolve-hierarchy] Resolved {resolved}, still unresolved {still_unresolved}',
+          file=sys.stderr)
+
+    return {'resolved': resolved, 'unresolved': still_unresolved}
+
+
+def index_build_dependencies(
+    conn: sqlite3.Connection,
+    name: str,
+    repo_path: Path,
+    incremental: bool = False,
+) -> dict:
+    """Parse build files and store dependencies as edges with edge_type='build_dependency'.
+
+    External deps: target_file=NULL, metadata=coordinate.
+    Internal project deps: target_file=module_path, metadata='project:<module>'.
+    """
+    from build_parser import parse_build_files
+
+    ensure_dep_tables(conn)
+
+    deps = parse_build_files(repo_path)
+    if not deps:
+        return {'build_deps': 0}
+
+    now_ts = int(time.time() * 1000)
+
+    # Clear old build_dependency edges for this codebase before inserting
+    conn.execute(
+        "DELETE FROM edges WHERE codebase = ? AND edge_type = 'build_dependency'",
+        (name,),
+    )
+
+    inserted = 0
+    for dep in deps:
+        target_file = None
+        metadata = dep['coordinate']
+
+        if dep.get('is_internal') and dep.get('module_path'):
+            target_file = dep['module_path']
+            metadata = f"project:{dep['module_path']}"
+
+        conn.execute(
+            'INSERT INTO edges (codebase, source_file, target_file, edge_type, metadata, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (name, dep.get('source_file', ''), target_file, 'build_dependency', metadata, now_ts),
+        )
+        inserted += 1
+
+    conn.commit()
+    print(f'[codebase-index] Stored {inserted} build dependencies for {name}', file=sys.stderr)
+    return {'build_deps': inserted}
+
+
+def _run_community_detection(conn: sqlite3.Connection, codebase: str) -> dict:
+    """Run Louvain community detection on call+import edges for a codebase.
+
+    Standalone version that avoids importing unified_memory_server (heavy MCP deps).
+    """
+    try:
+        import igraph as ig
+    except ImportError:
+        return {'error': 'igraph not installed'}
+
+    rows = conn.execute(
+        "SELECT source_file, target_file FROM edges "
+        "WHERE codebase = ? AND target_file IS NOT NULL "
+        "AND edge_type IN ('calls', 'import', 'static_import', 'wildcard_import', "
+        "'extends', 'implements')",
+        (codebase,),
+    ).fetchall()
+
+    if not rows:
+        return {'error': 'No edges found for codebase', 'codebase': codebase}
+
+    node_set: set[str] = set()
+    edge_list: list[tuple[str, str]] = []
+    for row in rows:
+        node_set.add(row['source_file'])
+        node_set.add(row['target_file'])
+        edge_list.append((row['source_file'], row['target_file']))
+
+    node_list = sorted(node_set)
+    node_index = {name: idx for idx, name in enumerate(node_list)}
+
+    g = ig.Graph(directed=True)
+    g.add_vertices(len(node_list))
+    g.vs['name'] = node_list
+    g.add_edges([(node_index[s], node_index[t]) for s, t in edge_list])
+
+    g_undirected = g.as_undirected(mode='collapse')
+    partition = g_undirected.community_multilevel()
+
+    now_ts = int(time.time() * 1000)
+    conn.execute('DELETE FROM communities WHERE codebase = ?', (codebase,))
+    for vid, community_id in enumerate(partition.membership):
+        conn.execute(
+            'INSERT INTO communities (codebase, file_path, community_id, updated_at) VALUES (?, ?, ?, ?)',
+            (codebase, node_list[vid], community_id, now_ts),
+        )
+
+    edge_count = len(rows)
+    community_count = max(partition.membership) + 1 if partition.membership else 0
+    conn.execute(
+        'INSERT OR REPLACE INTO community_meta (codebase, edge_count, community_count, computed_at) VALUES (?, ?, ?, ?)',
+        (codebase, edge_count, community_count, now_ts),
+    )
+    conn.commit()
+
+    return {
+        'codebase': codebase,
+        'nodes': len(node_list),
+        'edges': len(edge_list),
+        'communities': community_count,
+        'modularity': round(partition.modularity, 4),
+    }
+
+
+def identify_high_value_nodes(
+    conn: sqlite3.Connection,
+    codebase: str,
+    min_incoming_edges: int = 5,
+) -> list[dict]:
+    """Identify high-value symbols for LLM labeling.
+
+    Criteria:
+    - Symbols with >N incoming edges (callers/dependents)
+    - Public API annotations (@RestController, @GetMapping, export)
+    - Module entry points (main, index, app files)
+    """
+    ensure_dep_tables(conn)
+    candidates = []
+
+    # 1. Symbols with many incoming edges
+    rows = conn.execute(
+        'SELECT * FROM ('
+        '  SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.end_line, s.metadata, '
+        '  (SELECT COUNT(*) FROM edges e WHERE e.target_file = s.file_path AND e.codebase = s.codebase) as incoming '
+        '  FROM symbols s WHERE s.codebase = ?'
+        ') WHERE incoming >= ?',
+        (codebase, min_incoming_edges),
+    ).fetchall()
+    for r in rows:
+        candidates.append(dict(r))
+
+    # 2. Entry point files (main, index, app)
+    seen_ids = {c['id'] for c in candidates}
+    entry_patterns = ['%/main.%', '%/index.%', '%/app.%', '%/Application.%', '%/server.%']
+    for pattern in entry_patterns:
+        rows = conn.execute(
+            'SELECT id, file_path, name, kind, start_line, end_line, metadata '
+            'FROM symbols WHERE codebase = ? AND file_path LIKE ?',
+            (codebase, pattern),
+        ).fetchall()
+        for r in rows:
+            if r['id'] not in seen_ids:
+                d = dict(r)
+                d['incoming'] = 0
+                candidates.append(d)
+                seen_ids.add(r['id'])
+
+    return candidates
+
+
+def label_nodes_batch(
+    conn: sqlite3.Connection,
+    codebase: str,
+    candidates: list[dict],
+    api_key: str,
+    delay_ms: int = 100,
+) -> dict:
+    """Send high-value node signatures to GPT-4o-mini for semantic labeling.
+
+    Labels are cached in symbols.metadata JSON (key: 'label').
+    Nodes with unchanged content hashes are skipped.
+    """
+    import time as time_mod
+    try:
+        import openai
+    except ImportError:
+        return {'error': 'openai package not installed. Run: pip install openai'}
+
+    client = openai.OpenAI(api_key=api_key)
+    labeled = 0
+    skipped = 0
+    errors = 0
+
+    for candidate in candidates:
+        sym_id = candidate['id']
+        file_path = candidate['file_path']
+
+        # Check if already labeled with same content
+        existing_meta = candidate.get('metadata')
+        if existing_meta:
+            try:
+                meta = json.loads(existing_meta)
+                if 'label' in meta and 'content_hash' in meta:
+                    # Read current file content hash from codebase_meta
+                    cm_row = conn.execute(
+                        'SELECT content_hash FROM codebase_meta WHERE codebase = ? AND file_path = ?',
+                        (codebase, file_path),
+                    ).fetchone()
+                    if cm_row and cm_row['content_hash'] == meta['content_hash']:
+                        skipped += 1
+                        continue
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Build context: symbol name + kind + file path
+        context = f"{candidate['kind']} {candidate['name']} in {file_path}"
+        # Try to get a snippet of the source from chunks
+        chunk_row = conn.execute(
+            "SELECT content FROM chunks WHERE file_path LIKE ? AND start_line <= ? AND end_line >= ? LIMIT 1",
+            (f'codebase:{codebase}/{file_path}', candidate['start_line'], candidate['start_line']),
+        ).fetchone()
+        if chunk_row:
+            snippet = chunk_row['content'][:500]
+            context += f'\n\nCode:\n{snippet}'
+
+        try:
+            response = client.chat.completions.create(
+                model='gpt-4o-mini',
+                messages=[{
+                    'role': 'user',
+                    'content': (
+                        f'Describe what this code element does in ONE sentence (max 100 chars).\n\n{context}'
+                    ),
+                }],
+                max_tokens=50,
+                temperature=0,
+            )
+            label = response.choices[0].message.content.strip()[:100]
+
+            # Get content hash for cache invalidation
+            cm_row = conn.execute(
+                'SELECT content_hash FROM codebase_meta WHERE codebase = ? AND file_path = ?',
+                (codebase, file_path),
+            ).fetchone()
+            content_hash_val = cm_row['content_hash'] if cm_row else ''
+
+            meta_json = json.dumps({'label': label, 'content_hash': content_hash_val})
+            conn.execute(
+                'UPDATE symbols SET metadata = ? WHERE id = ?',
+                (meta_json, sym_id),
+            )
+            labeled += 1
+
+            if delay_ms > 0:
+                time_mod.sleep(delay_ms / 1000.0)
+
+        except Exception as e:
+            print(f'[label] Failed to label {candidate["name"]}: {e}', file=sys.stderr)
+            errors += 1
+
+    conn.commit()
+    return {'labeled': labeled, 'skipped': skipped, 'errors': errors}
+
+
 def main():
     parser = argparse.ArgumentParser(description='Index codebases for semantic search')
     parser.add_argument('--path', type=str, help='Path to repository root')
@@ -546,8 +1180,27 @@ def main():
     parser.add_argument('--list', action='store_true', help='List indexed codebases')
     parser.add_argument('--remove', action='store_true', help='Remove a codebase (requires --name)')
     parser.add_argument('--model', type=str, default=DEFAULT_MODEL, help='Embedding model name')
-    parser.add_argument('--deps', action='store_true', help='Extract dependency graph (imports + symbols)')
+    parser.add_argument('--deps', action='store_true', help='Extract dependency graph (imports + symbols + hierarchy)')
     parser.add_argument('--deps-only', action='store_true', help='Only extract dependencies, skip chunk embedding')
+    parser.add_argument('--calls', action='store_true', help='Extract call graph (function-level call edges)')
+    parser.add_argument('--resolve-hierarchy', action='store_true',
+                        help='Resolve unresolved hierarchy edges against symbols table across all codebases')
+    parser.add_argument('--build-deps', action='store_true',
+                        help='Parse build files (Gradle, Maven, pip, npm) and store as build_dependency edges')
+    parser.add_argument('--resolve-cross-repo', action='store_true',
+                        help='Resolve cross-repo deps and type hierarchy against indexed codebases')
+    parser.add_argument('--communities', action='store_true',
+                        help='Run Louvain community detection on the dependency graph')
+    parser.add_argument('--scip', action='store_true',
+                        help='Run SCIP indexers as optional Tier 2 pass (requires working build)')
+    parser.add_argument('--dims', type=int, default=0,
+                        help='Matryoshka truncation dimension (64/128/256/384/512/768, default: 256 for nomic model, 0=full for others)')
+    parser.add_argument('--label', action='store_true',
+                        help='Run LLM semantic labeling on high-value nodes via GPT-4o-mini')
+    parser.add_argument('--label-delay', type=int, default=100,
+                        help='Delay between GPT-4o-mini API calls in ms (default: 100)')
+    parser.add_argument('--label-min-edges', type=int, default=5,
+                        help='Minimum incoming edges for a node to be labeled (default: 5)')
 
     args = parser.parse_args()
 
@@ -565,6 +1218,22 @@ def main():
         conn.close()
         return
 
+    if args.resolve_hierarchy:
+        result = resolve_hierarchy_edges(conn)
+        print(f'\nHierarchy resolution result: {result}')
+        conn.close()
+        return
+
+    if args.resolve_cross_repo:
+        from build_parser import resolve_cross_repo_deps, resolve_cross_repo_types
+        ensure_dep_tables(conn)
+        dep_result = resolve_cross_repo_deps(conn)
+        print(f'\nCross-repo dependency resolution: {dep_result}')
+        type_result = resolve_cross_repo_types(conn)
+        print(f'Cross-repo type resolution: {type_result}')
+        conn.close()
+        return
+
     if not args.path or not args.name:
         parser.error('--path and --name are required for indexing')
 
@@ -576,7 +1245,28 @@ def main():
     # Chunk embedding pass (skip if --deps-only)
     if not args.deps_only:
         model_name = args.model
-        dims = MODEL_DIMS.get(model_name, 384)
+        dims = MODEL_DIMS.get(model_name, 768)
+
+        # Determine truncation dimension
+        truncate_dims = args.dims
+        doc_prefix = ''
+        if model_name == 'nomic-ai/nomic-embed-text-v1.5':
+            if truncate_dims == 0:
+                truncate_dims = DEFAULT_TRUNCATE_DIMS
+            if truncate_dims not in MATRYOSHKA_DIMS:
+                print(f'Error: --dims must be one of {sorted(MATRYOSHKA_DIMS)}', file=sys.stderr)
+                sys.exit(1)
+            doc_prefix = CODEBASE_DOC_PREFIX
+            print(f'[codebase-index] Matryoshka: {dims}d -> {truncate_dims}d '
+                  f'({dims / truncate_dims:.1f}x storage reduction)', file=sys.stderr)
+
+        # Check if model changed — if so, purge all codebase chunks and force full reindex
+        needs_reindex = check_codebase_model(conn, model_name)
+        if needs_reindex:
+            purge_all_codebase_chunks(conn)
+            # Force full reindex (disable incremental)
+            args.update = False
+
         rotate_fn, codebook = load_quantization_params(conn, model_name, dims)
         model = load_model(model_name)
 
@@ -584,8 +1274,26 @@ def main():
             conn, model, rotate_fn, codebook,
             args.name, repo_path,
             incremental=args.update,
+            truncate_dims=truncate_dims,
+            doc_prefix=doc_prefix,
         )
         print(f'\nChunk indexing result: {result}')
+
+        # Report storage reduction for Matryoshka
+        if truncate_dims > 0 and truncate_dims < dims:
+            print(f'Embedding storage: {dims / truncate_dims:.1f}x reduction '
+                  f'({dims}d -> {truncate_dims}d)', file=sys.stderr)
+
+        # Record codebase embedding model and dims in meta table
+        write_codebase_model_meta(conn, model_name)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('codebase_embedding_dims', ?)",
+                (str(truncate_dims if truncate_dims > 0 else dims),),
+            )
+            conn.commit()
+        except Exception as e:
+            print(f'[codebase-index] Warning: could not write dims meta: {e}', file=sys.stderr)
 
     # Dependency extraction pass
     if args.deps or args.deps_only:
@@ -594,6 +1302,127 @@ def main():
             incremental=args.update,
         )
         print(f'\nDependency indexing result: {dep_result}')
+
+    # Call graph extraction pass (runs after deps since it needs symbols/imports)
+    if args.calls:
+        call_result = index_call_graph(
+            conn, args.name, repo_path,
+            incremental=args.update,
+        )
+        print(f'\nCall graph result: {call_result}')
+
+    # Build dependency extraction pass
+    if args.build_deps:
+        build_result = index_build_dependencies(
+            conn, args.name, repo_path,
+            incremental=args.update,
+        )
+        print(f'\nBuild dependency result: {build_result}')
+
+    # SCIP indexer pass (optional Tier 2 — higher confidence edges)
+    if args.scip:
+        from scip_parser import detect_scip_languages, run_scip_indexer, parse_scip_output
+        ensure_dep_tables(conn)
+        languages = detect_scip_languages(repo_path)
+        if languages:
+            print(f'[scip] Detected languages: {", ".join(languages)}', file=sys.stderr)
+            now_ts = int(time.time())
+            total_scip_edges = 0
+            for lang in languages:
+                scip_path = run_scip_indexer(repo_path, lang)
+                if scip_path is None:
+                    print(f'[scip] Skipping {lang} (indexer unavailable or build failed)', file=sys.stderr)
+                    continue
+                scip_edges = parse_scip_output(scip_path)
+                if not scip_edges:
+                    print(f'[scip] No edges extracted for {lang}', file=sys.stderr)
+                    continue
+                # Merge: SCIP edges replace tree-sitter edges for same call site
+                for edge in scip_edges:
+                    # Check if a tree-sitter edge exists for same source+target
+                    existing = conn.execute(
+                        'SELECT id FROM edges WHERE codebase = ? AND source_file = ? AND target_file = ? '
+                        "AND edge_type != 'build_dependency' LIMIT 1",
+                        (args.name, edge['source_file'], edge['target_file']),
+                    ).fetchone()
+                    if existing:
+                        # Replace with higher confidence SCIP edge
+                        conn.execute(
+                            'UPDATE edges SET edge_type = ?, metadata = ?, confidence = ?, updated_at = ? WHERE id = ?',
+                            (edge['edge_type'], edge['metadata'], edge['confidence'], now_ts, existing['id']),
+                        )
+                    else:
+                        # Insert new SCIP-only edge
+                        conn.execute(
+                            'INSERT INTO edges (codebase, source_file, target_file, edge_type, metadata, confidence, updated_at) '
+                            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                            (args.name, edge['source_file'], edge['target_file'],
+                             edge['edge_type'], edge['metadata'], edge['confidence'], now_ts),
+                        )
+                    total_scip_edges += 1
+                conn.commit()
+                # Clean up .scip file
+                try:
+                    scip_path.unlink()
+                except Exception:
+                    pass
+                print(f'[scip] {lang}: {len(scip_edges)} edges processed', file=sys.stderr)
+            print(f'\nSCIP indexing result: {total_scip_edges} edges merged', file=sys.stderr)
+        else:
+            print('[scip] No supported languages detected in repo', file=sys.stderr)
+
+    # LLM semantic labeling pass
+    if args.label:
+        ensure_dep_tables(conn)
+        candidates = identify_high_value_nodes(conn, args.name, min_incoming_edges=args.label_min_edges)
+        print(f'[label] Found {len(candidates)} high-value nodes for labeling', file=sys.stderr)
+        if candidates:
+            # Get API key from keychain
+            import subprocess as sp
+            try:
+                api_key = sp.run(
+                    ['security', 'find-generic-password', '-a', os.getlogin(), '-s', 'openai-api-key', '-w'],
+                    capture_output=True, text=True,
+                ).stdout.strip()
+            except Exception:
+                api_key = os.environ.get('OPENAI_API_KEY', '')
+            if not api_key:
+                print('[label] Error: No OpenAI API key found (keychain or OPENAI_API_KEY env)', file=sys.stderr)
+            else:
+                label_result = label_nodes_batch(
+                    conn, args.name, candidates, api_key,
+                    delay_ms=args.label_delay,
+                )
+                print(f'\nLLM labeling result: {label_result}')
+
+    # Community detection pass
+    if args.communities:
+        ensure_dep_tables(conn)
+        # Ensure communities/community_meta tables exist
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS communities (
+                codebase TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                community_id INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (codebase, file_path)
+            )
+        ''')
+        conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_communities_codebase_community
+            ON communities(codebase, community_id)
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS community_meta (
+                codebase TEXT PRIMARY KEY,
+                edge_count INTEGER NOT NULL,
+                community_count INTEGER NOT NULL,
+                computed_at INTEGER NOT NULL
+            )
+        ''')
+        conn.commit()
+        comm_result = _run_community_detection(conn, args.name)
+        print(f'\nCommunity detection result: {comm_result}')
 
     conn.close()
 
