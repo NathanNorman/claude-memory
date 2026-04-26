@@ -72,9 +72,23 @@ def file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+def _retry_on_locked(fn, max_retries=5, base_delay=1.0):
+    """Retry a callable on sqlite3.OperationalError (database is locked)."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e) and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                print(f'[codebase-index] DB locked, retry {attempt + 1}/{max_retries} in {delay:.0f}s...', file=sys.stderr)
+                time.sleep(delay)
+            else:
+                raise
+
+
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
-    conn.execute('PRAGMA busy_timeout = 5000')
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.execute('PRAGMA busy_timeout = 30000')
     conn.execute('PRAGMA journal_mode = WAL')
     conn.row_factory = sqlite3.Row
     # Ensure codebase_meta table exists
@@ -369,12 +383,14 @@ def index_codebase(
         old_rows = conn.execute(
             'SELECT rowid FROM chunks WHERE file_path = ?', (old_prefix,)
         ).fetchall()
-        for row in old_rows:
-            try:
-                conn.execute('DELETE FROM chunks_fts WHERE rowid = ?', (row['rowid'],))
-            except Exception:
-                pass
-        conn.execute('DELETE FROM chunks WHERE file_path = ?', (old_prefix,))
+        def _delete_old():
+            for row in old_rows:
+                try:
+                    conn.execute('DELETE FROM chunks_fts WHERE rowid = ?', (row['rowid'],))
+                except Exception:
+                    pass
+            conn.execute('DELETE FROM chunks WHERE file_path = ?', (old_prefix,))
+        _retry_on_locked(_delete_old)
 
         for ci, chunk in enumerate(chunks):
             batch.append({
@@ -399,7 +415,7 @@ def index_codebase(
         if len(batch) >= batch_size:
             stored = embed_and_store_batch(conn, model, batch, rotate_fn, codebook, truncate_dims=truncate_dims, doc_prefix=doc_prefix)
             total_chunks += stored
-            conn.commit()
+            _retry_on_locked(conn.commit)
             batch = []
             elapsed = time.time() - t0
             print(
@@ -434,7 +450,7 @@ def index_codebase(
             )
             print(f'[codebase-index] Removed deleted: {del_rel}', file=sys.stderr)
 
-    conn.commit()
+    _retry_on_locked(conn.commit)
     elapsed = time.time() - t0
     print(f'\n[codebase-index] Done: {total_files} files, {total_chunks} chunks, '
           f'{skipped_files} skipped, {elapsed:.1f}s', file=sys.stderr)
@@ -1201,6 +1217,14 @@ def main():
                         help='Delay between GPT-4o-mini API calls in ms (default: 100)')
     parser.add_argument('--label-min-edges', type=int, default=5,
                         help='Minimum incoming edges for a node to be labeled (default: 5)')
+    parser.add_argument('--batch-dir', type=str,
+                        help='Scan directory for git repos and index all (loads model once)')
+    parser.add_argument('--max-files', type=int, default=5000,
+                        help='Skip repos with more than this many tracked files (default: 5000)')
+    parser.add_argument('--min-files', type=int, default=3,
+                        help='Skip repos with fewer than this many tracked files (default: 3)')
+    parser.add_argument('--exclude', type=str, default='',
+                        help='Comma-separated repo names to skip in batch mode')
 
     args = parser.parse_args()
 
@@ -1231,6 +1255,108 @@ def main():
         print(f'\nCross-repo dependency resolution: {dep_result}')
         type_result = resolve_cross_repo_types(conn)
         print(f'Cross-repo type resolution: {type_result}')
+        conn.close()
+        return
+
+    # Batch mode: scan directory for git repos, load model once, index all
+    if args.batch_dir:
+        import subprocess
+        batch_root = Path(args.batch_dir).expanduser().resolve()
+        if not batch_root.is_dir():
+            print(f'Error: {batch_root} is not a directory', file=sys.stderr)
+            sys.exit(1)
+
+        # Find git repos
+        exclude_set = {x.strip() for x in args.exclude.split(',') if x.strip()}
+        repos = []
+        for entry in sorted(batch_root.iterdir()):
+            if not entry.is_dir() or entry.name.startswith('.'):
+                continue
+            if entry.name in exclude_set:
+                print(f'[batch] SKIP {entry.name} (excluded)', file=sys.stderr)
+                continue
+            if not (entry / '.git').exists():
+                continue
+            # Count tracked files
+            try:
+                result = subprocess.run(
+                    ['git', '-C', str(entry), 'ls-files'],
+                    capture_output=True, text=True, timeout=10,
+                )
+                count = len(result.stdout.strip().splitlines()) if result.stdout.strip() else 0
+            except Exception:
+                count = 0
+            if count < args.min_files:
+                print(f'[batch] SKIP {entry.name} ({count} files — below minimum)', file=sys.stderr)
+                continue
+            if count > args.max_files:
+                print(f'[batch] SKIP {entry.name} ({count} files — above maximum)', file=sys.stderr)
+                continue
+            repos.append((entry, entry.name, count))
+
+        if not repos:
+            print('No repos found to index.', file=sys.stderr)
+            sys.exit(0)
+
+        # Check which are already indexed
+        existing = set()
+        try:
+            rows = conn.execute(
+                'SELECT DISTINCT codebase FROM codebase_meta'
+            ).fetchall()
+            existing = {r['codebase'] for r in rows}
+        except Exception:
+            pass
+
+        new_repos = [(p, n, c) for p, n, c in repos if n not in existing]
+        print(f'[batch] Found {len(repos)} repos, {len(existing & {n for _, n, _ in repos})} already indexed, '
+              f'{len(new_repos)} to index', file=sys.stderr)
+
+        if not new_repos:
+            print('[batch] All repos already indexed. Use --update for incremental.', file=sys.stderr)
+            conn.close()
+            return
+
+        # Load model ONCE
+        model_name = args.model
+        dims = MODEL_DIMS.get(model_name, 768)
+        truncate_dims = args.dims
+        doc_prefix = ''
+        if model_name == 'nomic-ai/nomic-embed-text-v1.5':
+            if truncate_dims == 0:
+                truncate_dims = DEFAULT_TRUNCATE_DIMS
+            doc_prefix = CODEBASE_DOC_PREFIX
+        rotate_fn, codebook = load_quantization_params(conn, model_name, dims)
+        model = load_model(model_name)
+        print(f'[batch] Model loaded. Indexing {len(new_repos)} repos...', file=sys.stderr)
+
+        # Index each repo sequentially with the warm model
+        indexed = 0
+        failed = 0
+        for repo_path, name, file_count in new_repos:
+            print(f'\n[batch] ({indexed + failed + 1}/{len(new_repos)}) {name} ({file_count} files)...', file=sys.stderr)
+            try:
+                result = index_codebase(
+                    conn, model, rotate_fn, codebook,
+                    name, repo_path,
+                    incremental=False,
+                    truncate_dims=truncate_dims,
+                    doc_prefix=doc_prefix,
+                )
+                write_codebase_model_meta(conn, model_name)
+                _retry_on_locked(conn.commit)
+                indexed += 1
+                print(f'[batch] OK {name}: {result.get("chunks_stored", 0)} chunks', file=sys.stderr)
+            except Exception as e:
+                failed += 1
+                print(f'[batch] FAIL {name}: {e}', file=sys.stderr)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+        print(f'\n[batch] Done: {indexed} indexed, {failed} failed, '
+              f'{len(repos) - len(new_repos)} skipped (already indexed)', file=sys.stderr)
         conn.close()
         return
 
