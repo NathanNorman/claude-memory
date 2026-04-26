@@ -1417,6 +1417,263 @@ class VectorSearchBackend:
 
 
 # ──────────────────────────────────────────────────────────────
+# Section 1b2: TurboQuantBackend — sidecar file-based quantized search
+# ──────────────────────────────────────────────────────────────
+
+
+class TurboQuantBackend:
+    """Fast quantized vector search using sidecar files.
+
+    Loads pre-built sidecar files for three-stage search:
+    1. Binary Hamming (all→top 1000)
+    2. 4-bit TurboQuant dot products (1000→top 50)
+    3. Float32 mmap rerank (50→top k)
+
+    Sidecar files (in ~/.claude-memory/index/):
+    - packed_vectors.bin: concatenated packed 4-bit vectors
+    - rerank_matrix.f32: float32 matrix for exact reranking (mmap'd)
+    - quantization.json: metadata (codebook, rotation_seed, dims, rowid_map)
+
+    Falls back gracefully if sidecar files don't exist.
+    """
+
+    BINARY_TOP_K = 1000
+    TURBOQUANT_TOP_K = 50
+
+    def __init__(self, sidecar_dir: Path, db_path: Path):
+        self._sidecar_dir = sidecar_dir
+        self._db_path = db_path
+        self._conn: Optional[sqlite3.Connection] = None
+        self._loaded = False
+
+        # Sidecar state
+        self._packed_list: Optional[list[bytes]] = None
+        self._rerank_mmap = None  # numpy mmap
+        self._binary_matrix = None
+        self._rowids: Optional[list[int]] = None
+        self._dims: int = 0
+        self._bit_width: int = 4
+        self._rotate_fn = None
+        self._inv_rotate_fn = None
+        self._codebook = None
+        self._model = None
+        self._model_name: str = ''
+
+    def _ensure_conn(self) -> Optional[sqlite3.Connection]:
+        if self._conn is not None:
+            return self._conn
+        try:
+            conn = sqlite3.connect(str(self._db_path), timeout=10.0)
+            conn.execute('PRAGMA busy_timeout = 5000')
+            conn.row_factory = sqlite3.Row
+            self._conn = conn
+            return conn
+        except Exception as e:
+            log.warning(f'TurboQuant DB connection failed: {e}')
+            return None
+
+    def load(self) -> bool:
+        """Load sidecar files. Returns True if all files loaded successfully."""
+        meta_path = self._sidecar_dir / 'quantization.json'
+        packed_path = self._sidecar_dir / 'packed_vectors.bin'
+        rerank_path = self._sidecar_dir / 'rerank_matrix.f32'
+
+        if not all(p.exists() for p in [meta_path, packed_path, rerank_path]):
+            log.warning(
+                'TurboQuant sidecar files not found in %s — '
+                'falling back to float32', self._sidecar_dir,
+            )
+            return False
+
+        t0 = time.time()
+        try:
+            import numpy as np
+            from quantize import generate_rotation
+
+            # Load metadata
+            with open(meta_path) as f:
+                meta = json.load(f)
+
+            self._dims = meta['dims']
+            self._bit_width = meta.get('bit_width', 4)
+            self._model_name = meta.get('model_name', '')
+            rowid_map = meta['rowid_map']  # list of rowids
+            self._rowids = rowid_map
+            n_centroids = 1 << self._bit_width
+            codebook = np.array(meta['codebook'], dtype=np.float32)
+            if len(codebook) != n_centroids:
+                log.warning('TurboQuant codebook size mismatch')
+                return False
+            self._codebook = codebook
+
+            seed = meta['rotation_seed']
+            fwd, inv = generate_rotation(self._dims, seed)
+            self._rotate_fn = fwd
+            self._inv_rotate_fn = inv
+
+            # Load packed vectors
+            from quantize import packed_size
+            vec_size = packed_size(self._dims, self._bit_width)
+            packed_data = packed_path.read_bytes()
+            n_vectors = len(packed_data) // vec_size
+            if n_vectors != len(rowid_map):
+                log.warning(
+                    'TurboQuant vector count mismatch: %d in file vs %d in map',
+                    n_vectors, len(rowid_map),
+                )
+                return False
+
+            self._packed_list = [
+                packed_data[i * vec_size:(i + 1) * vec_size]
+                for i in range(n_vectors)
+            ]
+
+            # Memory-map float32 rerank matrix
+            self._rerank_mmap = np.memmap(
+                str(rerank_path), dtype=np.float32, mode='r',
+                shape=(n_vectors, self._dims),
+            )
+
+            # Build binary matrix from packed vectors (sign bits)
+            from quantize import quantize_binary
+            # Reconstruct binary from the rerank matrix (exact float32)
+            self._binary_matrix = quantize_binary(self._rerank_mmap)
+
+            self._loaded = True
+            elapsed = time.time() - t0
+            log.info(
+                'TurboQuant sidecar loaded: %d vectors, %dd, %d-bit in %.2fs',
+                n_vectors, self._dims, self._bit_width, elapsed,
+            )
+            return True
+
+        except Exception as e:
+            log.warning('TurboQuant sidecar load failed: %s', e)
+            return False
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    def _ensure_model(self):
+        """Lazy-load the embedding model."""
+        if self._model is not None:
+            return self._model
+        try:
+            from sentence_transformers import SentenceTransformer
+            _MODEL_REPOS = {
+                'bge-base-en-v1.5': 'BAAI/bge-base-en-v1.5',
+                'bge-small-en-v1.5': 'BAAI/bge-small-en-v1.5',
+                'bge-large-en-v1.5': 'BAAI/bge-large-en-v1.5',
+            }
+            repo_id = _MODEL_REPOS.get(self._model_name, self._model_name)
+            self._model = SentenceTransformer(repo_id)
+            return self._model
+        except Exception as e:
+            log.warning('TurboQuant model load failed: %s', e)
+            return None
+
+    def search(self, query: str, limit: int) -> list[dict]:
+        """Three-stage quantized search: binary → TurboQuant → float32 rerank."""
+        if not self._loaded or limit <= 0:
+            return []
+
+        model = self._ensure_model()
+        if model is None:
+            return []
+
+        import numpy as np
+        from quantize import batch_quantized_dot_products, hamming_distance, quantize_binary
+
+        # Embed query
+        query_vec = model.encode(query, normalize_embeddings=True)
+        query_vec = np.array(query_vec, dtype=np.float32).flatten()
+
+        # Stage 1: Binary Hamming coarse pass
+        binary_query = quantize_binary(query_vec.reshape(1, -1))
+        distances = hamming_distance(binary_query, self._binary_matrix)
+        stage1_k = min(self.BINARY_TOP_K, len(distances))
+        if stage1_k < len(distances):
+            stage1_indices = np.argpartition(distances, stage1_k)[:stage1_k]
+        else:
+            stage1_indices = np.arange(len(distances))
+
+        # Stage 2: TurboQuant 4-bit dot products
+        query_rotated = self._rotate_fn(query_vec)
+        stage1_packed = [self._packed_list[i] for i in stage1_indices]
+        approx_sims = batch_quantized_dot_products(
+            query_rotated, stage1_packed, self._codebook, self._dims,
+        )
+        stage2_k = min(self.TURBOQUANT_TOP_K, len(approx_sims))
+        stage2_local = np.argsort(approx_sims)[-stage2_k:]
+        stage2_indices = stage1_indices[stage2_local]
+
+        # Stage 3: Exact float32 rerank via mmap
+        candidate_matrix = self._rerank_mmap[stage2_indices]
+        # Normalize (should already be normalized, but defensive)
+        norms = np.linalg.norm(candidate_matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        candidate_matrix = candidate_matrix / norms
+
+        exact_sims = candidate_matrix @ query_vec
+        top_within = np.argsort(exact_sims)[-limit:][::-1]
+        top_indices = [stage2_indices[j] for j in top_within]
+        similarities = np.array([exact_sims[j] for j in top_within])
+
+        # Look up chunk content from DB
+        conn = self._ensure_conn()
+        if conn is None:
+            return []
+
+        results = []
+        for idx, score in zip(top_indices, similarities):
+            score = float(score)
+            if score <= 0:
+                continue
+            rowid = self._rowids[idx]
+            chunk = conn.execute(
+                'SELECT id, file_path, chunk_index, start_line, end_line, '
+                'title, content FROM chunks WHERE rowid = ?',
+                (rowid,),
+            ).fetchone()
+            if chunk:
+                results.append({
+                    'id': chunk['id'],
+                    'file_path': chunk['file_path'],
+                    'chunk_index': chunk['chunk_index'],
+                    'start_line': chunk['start_line'],
+                    'end_line': chunk['end_line'],
+                    'title': chunk['title'],
+                    'content': chunk['content'],
+                    'score': score,
+                })
+        return results
+
+    def get_stats(self) -> dict:
+        return {
+            'status': 'ok' if self._loaded else 'unavailable',
+            'backend': 'turboquant',
+            'vectors': len(self._rowids) if self._rowids else 0,
+            'dims': self._dims,
+            'bit_width': self._bit_width,
+            'model': self._model_name,
+        }
+
+    def close(self) -> None:
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        self._rerank_mmap = None
+        self._packed_list = None
+        self._binary_matrix = None
+        self._rowids = None
+        self._loaded = False
+
+
+# ──────────────────────────────────────────────────────────────
 # Section 1c: Temporal & Entity Retrieval
 # ──────────────────────────────────────────────────────────────
 
@@ -2295,6 +2552,7 @@ mcp_app = FastMCP(
 # Backends (initialized at startup)
 flat_backend: Optional[FlatSearchBackend] = None
 vector_backend: Optional[VectorSearchBackend] = None
+turboquant_backend: Optional[TurboQuantBackend] = None
 temporal_backend: Optional[TemporalRetrieval] = None
 entity_backend: Optional[EntityRetrieval] = None
 
@@ -2474,9 +2732,20 @@ async def memory_search(
     flat_original = flat_backend.search_keyword(query, fetch_limit * 2)
 
     # Vector similarity search — synchronous, first call loads model (~2s), then fast
+    # Prefer TurboQuant sidecar backend if loaded (faster at scale)
     # Use codebase model with query prefix when searching codebase source
     vector_hits: list[dict] = []
-    if vector_backend:
+    if turboquant_backend and turboquant_backend.is_loaded and source != 'codebase':
+        try:
+            vector_hits = turboquant_backend.search(query, fetch_limit * 2)
+        except Exception as e:
+            log.warning(f'TurboQuant search failed, falling back to float32: {e}')
+            if vector_backend:
+                try:
+                    vector_hits = vector_backend.search(query, fetch_limit * 2)
+                except Exception as e2:
+                    log.warning(f'Vector search also failed: {e2}')
+    elif vector_backend:
         try:
             if source == 'codebase':
                 vector_hits = vector_backend.search_codebase(query, fetch_limit * 2)
@@ -3804,6 +4073,9 @@ async def get_status() -> dict:
     else:
         result['vector'] = {'status': 'unavailable'}
 
+    if turboquant_backend and turboquant_backend.is_loaded:
+        result['turboquant'] = turboquant_backend.get_stats()
+
     # Pipeline health (from job queue)
     try:
         from job_queue import JobQueue
@@ -4045,7 +4317,7 @@ async def index_session(
 
 
 async def run() -> None:
-    global flat_backend, vector_backend, graph_sidecar, temporal_backend, entity_backend
+    global flat_backend, vector_backend, turboquant_backend, graph_sidecar, temporal_backend, entity_backend
 
     # Initialize flat backend
     try:
@@ -4075,6 +4347,25 @@ async def run() -> None:
     except Exception as e:
         log.warning(f'Vector backend init failed: {e}')
         vector_backend = None
+
+    # Initialize TurboQuant sidecar backend (if VECTOR_BACKEND=turboquant or sidecar files exist)
+    vector_backend_env = os.environ.get('VECTOR_BACKEND', 'float32')
+    sidecar_dir = MEMORY_DIR / 'index'
+    if vector_backend_env == 'turboquant' or (sidecar_dir / 'quantization.json').exists():
+        try:
+            turboquant_backend = TurboQuantBackend(sidecar_dir, DB_PATH)
+            if turboquant_backend.load():
+                tq_stats = turboquant_backend.get_stats()
+                log.info(
+                    'TurboQuant backend ready: %d vectors (%dd, %d-bit)',
+                    tq_stats['vectors'], tq_stats['dims'], tq_stats['bit_width'],
+                )
+            else:
+                log.info('TurboQuant sidecar not available — using float32 vector backend')
+                turboquant_backend = None
+        except Exception as e:
+            log.warning('TurboQuant init failed: %s', e)
+            turboquant_backend = None
 
     # Initialize temporal and entity retrieval backends
     try:
@@ -4150,6 +4441,8 @@ async def run() -> None:
             flat_backend.close()
         if vector_backend:
             vector_backend.close()
+        if turboquant_backend:
+            turboquant_backend.close()
         for name, backends in addon_backends.items():
             try:
                 backends['flat'].close()
