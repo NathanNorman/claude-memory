@@ -2922,6 +2922,173 @@ async def dependency_search(
 
 
 @mcp_app.tool()
+async def entity_browse(
+    type: str = '',
+    query: str = '',
+    limit: int = 50,
+) -> dict:
+    """Browse entities extracted from memory content.
+
+    Lists entities with their occurrence counts. Use to discover what
+    tools, projects, and people appear most frequently in memory.
+
+    Args:
+        type: Filter by entity type: "tool", "project", "person". Empty = all types.
+        query: Filter entity values containing this substring (case-insensitive).
+        limit: Maximum results to return (default 50, max 200).
+    """
+    if not flat_backend:
+        return {'error': 'Flat search backend not available', 'results': []}
+
+    conn = flat_backend._ensure_conn()
+    limit = min(max(1, limit), 200)
+
+    sql = (
+        'SELECT entity_value, entity_type, COUNT(*) as count '
+        'FROM chunk_entities'
+    )
+    conditions = []
+    params: list = []
+
+    if type:
+        conditions.append('entity_type = ?')
+        params.append(type)
+    if query:
+        conditions.append('entity_value LIKE ?')
+        params.append(f'%{query.lower()}%')
+
+    if conditions:
+        sql += ' WHERE ' + ' AND '.join(conditions)
+
+    sql += ' GROUP BY entity_value, entity_type ORDER BY count DESC LIMIT ?'
+    params.append(limit)
+
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except Exception as e:
+        return {'error': str(e), 'results': []}
+
+    results = [
+        {
+            'entity': row['entity_value'],
+            'type': row['entity_type'],
+            'count': row['count'],
+        }
+        for row in rows
+    ]
+
+    return {'count': len(results), 'results': results}
+
+
+@mcp_app.tool()
+async def entity_graph(
+    entity: str,
+    depth: int = 1,
+    limit: int = 20,
+) -> dict:
+    """Explore entity co-occurrence relationships.
+
+    Shows which entities frequently appear together in the same chunks.
+    Depth 1 returns direct co-occurrences; depth 2 adds second-hop neighbors.
+
+    Args:
+        entity: Entity value to explore (case-insensitive).
+        depth: Traversal depth: 1 = direct neighbors, 2 = two hops (default 1, max 2).
+        limit: Maximum neighbors per hop (default 20, max 100).
+    """
+    if not flat_backend:
+        return {'error': 'Flat search backend not available', 'results': []}
+
+    conn = flat_backend._ensure_conn()
+    depth = min(max(1, depth), 2)
+    limit = min(max(1, limit), 100)
+    entity_lower = entity.lower()
+
+    # Depth 1: direct co-occurrences
+    try:
+        rows = conn.execute(
+            'SELECT CASE WHEN entity_a = ? THEN entity_b ELSE entity_a END as neighbor, '
+            'COUNT(*) as co_occurrence_count '
+            'FROM entity_relationships '
+            'WHERE entity_a = ? OR entity_b = ? '
+            'GROUP BY neighbor '
+            'ORDER BY co_occurrence_count DESC '
+            'LIMIT ?',
+            (entity_lower, entity_lower, entity_lower, limit),
+        ).fetchall()
+    except Exception as e:
+        return {'error': str(e), 'results': []}
+
+    depth1_neighbors = []
+    depth1_set = {entity_lower}
+    for row in rows:
+        neighbor = row['neighbor']
+        depth1_set.add(neighbor)
+        # Look up entity type
+        type_row = conn.execute(
+            'SELECT entity_type FROM chunk_entities WHERE entity_value = ? LIMIT 1',
+            (neighbor,),
+        ).fetchone()
+        depth1_neighbors.append({
+            'entity': neighbor,
+            'type': type_row['entity_type'] if type_row else 'unknown',
+            'co_occurrence_count': row['co_occurrence_count'],
+            'depth': 1,
+        })
+
+    if depth < 2 or not depth1_neighbors:
+        return {
+            'entity': entity_lower,
+            'depth': 1,
+            'neighbor_count': len(depth1_neighbors),
+            'neighbors': depth1_neighbors,
+        }
+
+    # Depth 2: second-hop neighbors
+    depth2_neighbors = []
+    for d1 in depth1_neighbors[:10]:  # Cap first-hop expansion
+        d1_val = d1['entity']
+        try:
+            rows2 = conn.execute(
+                'SELECT CASE WHEN entity_a = ? THEN entity_b ELSE entity_a END as neighbor, '
+                'COUNT(*) as co_occurrence_count '
+                'FROM entity_relationships '
+                'WHERE entity_a = ? OR entity_b = ? '
+                'GROUP BY neighbor '
+                'ORDER BY co_occurrence_count DESC '
+                'LIMIT ?',
+                (d1_val, d1_val, d1_val, limit),
+            ).fetchall()
+        except Exception:
+            continue
+
+        for row in rows2:
+            neighbor = row['neighbor']
+            if neighbor in depth1_set:
+                continue
+            depth1_set.add(neighbor)
+            type_row = conn.execute(
+                'SELECT entity_type FROM chunk_entities WHERE entity_value = ? LIMIT 1',
+                (neighbor,),
+            ).fetchone()
+            depth2_neighbors.append({
+                'entity': neighbor,
+                'type': type_row['entity_type'] if type_row else 'unknown',
+                'co_occurrence_count': row['co_occurrence_count'],
+                'depth': 2,
+                'via': d1_val,
+            })
+
+    all_neighbors = depth1_neighbors + depth2_neighbors
+    return {
+        'entity': entity_lower,
+        'depth': depth,
+        'neighbor_count': len(all_neighbors),
+        'neighbors': all_neighbors,
+    }
+
+
+@mcp_app.tool()
 async def symbol_search(
     name: str,
     codebase: str = '',
