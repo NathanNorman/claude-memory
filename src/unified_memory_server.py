@@ -381,30 +381,27 @@ class FlatSearchBackend:
             return 0.0
 
     @staticmethod
-    def merge_rrf(hits_a: list[dict], hits_b: list[dict], k: int = 60) -> list[dict]:
-        """Reciprocal Rank Fusion merge of two result lists.
+    def merge_rrf_multi(ranked_lists: list[list[dict]], k: int = 60) -> list[dict]:
+        """Reciprocal Rank Fusion merge of N result lists.
 
         RRF scores each result as 1/(k + rank) summed across retrieval systems.
         k=60 is the standard constant from the original RRF paper.
-        Port of mergeHybridResults() from hybrid.ts.
+        Empty lists are silently skipped.
         """
         by_id: dict[str, dict] = {}
 
-        for rank, r in enumerate(hits_a):
-            by_id[r['id']] = {
-                'result': r,
-                'rrf_score': 1.0 / (k + rank + 1),
-            }
-
-        for rank, r in enumerate(hits_b):
-            rid = r['id']
-            if rid in by_id:
-                by_id[rid]['rrf_score'] += 1.0 / (k + rank + 1)
-            else:
-                by_id[rid] = {
-                    'result': r,
-                    'rrf_score': 1.0 / (k + rank + 1),
-                }
+        for hits in ranked_lists:
+            if not hits:
+                continue
+            for rank, r in enumerate(hits):
+                rid = r['id']
+                if rid in by_id:
+                    by_id[rid]['rrf_score'] += 1.0 / (k + rank + 1)
+                else:
+                    by_id[rid] = {
+                        'result': r,
+                        'rrf_score': 1.0 / (k + rank + 1),
+                    }
 
         merged = []
         for v in by_id.values():
@@ -1849,9 +1846,8 @@ def _search_addon(
         log.warning(f'Addon vector search failed for {source}: {e}')
 
     # RRF merge
-    if vector_hits:
-        merged = FlatSearchBackend.merge_rrf(flat_hits, vector_hits)
-    else:
+    merged = FlatSearchBackend.merge_rrf_multi([flat_hits, vector_hits])
+    if not merged:
         merged = flat_hits
 
     # Format results
@@ -1927,10 +1923,10 @@ async def memory_search(
         except Exception as e:
             log.warning(f'Vector search failed: {e}')
 
-    # Merge keyword + vector via RRF
-    if vector_hits:
-        merged = FlatSearchBackend.merge_rrf(flat_original, vector_hits)
-    else:
+    # Merge keyword + vector via RRF (N-way: additional signals added below)
+    ranked_lists = [flat_original, vector_hits]
+    merged = FlatSearchBackend.merge_rrf_multi(ranked_lists)
+    if not merged:
         merged = flat_original
 
     # Post-filter (ported from tools.ts handleMemorySearch)
@@ -2061,9 +2057,8 @@ async def codebase_search(
             log.warning(f'Vector search failed in codebase_search: {e}')
 
     # Merge via RRF
-    if vector_hits:
-        merged = FlatSearchBackend.merge_rrf(flat_hits, vector_hits)
-    else:
+    merged = FlatSearchBackend.merge_rrf_multi([flat_hits, vector_hits])
+    if not merged:
         merged = flat_hits
 
     results = []
