@@ -76,6 +76,50 @@ def load_float32_embeddings(conn: sqlite3.Connection, dims: int) -> tuple:
     return rowids, np.array(vectors, dtype=np.float32), skipped
 
 
+def load_quantized_embeddings(conn: sqlite3.Connection, dims: int, bit_width: int) -> tuple:
+    """Load already-quantized (packed) embeddings from chunks table."""
+    expected_size = packed_size(dims, bit_width)
+    rows = conn.execute(
+        'SELECT rowid, embedding FROM chunks WHERE embedding IS NOT NULL'
+    ).fetchall()
+
+    rowids = []
+    packed_vectors = []
+    skipped = 0
+    for row in rows:
+        blob = row[1]
+        if not blob or len(blob) != expected_size:
+            skipped += 1
+            continue
+        rowids.append(row[0])
+        packed_vectors.append(bytes(blob))
+
+    return rowids, packed_vectors, skipped
+
+
+def load_quantization_params(conn: sqlite3.Connection) -> dict | None:
+    """Load quantization params from quantization_meta table."""
+    try:
+        row = conn.execute(
+            'SELECT model_name, dims, bit_width, rotation_seed, codebook '
+            'FROM quantization_meta ORDER BY id DESC LIMIT 1'
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    codebook_blob = row[4]
+    n_centroids = len(codebook_blob) // 4
+    codebook = np.array(struct.unpack(f'{n_centroids}f', codebook_blob), dtype=np.float32)
+    return {
+        'model_name': row[0],
+        'dims': row[1],
+        'bit_width': row[2],
+        'rotation_seed': row[3],
+        'codebook': codebook,
+    }
+
+
 def store_quantization_params(
     conn: sqlite3.Connection,
     model_name: str,
@@ -256,12 +300,72 @@ def main():
         print('  (skipped in dry-run mode)')
     print()
 
-    # Step 2: Load float32 embeddings
-    print('Step 2: Load float32 embeddings')
+    # Step 2: Load embeddings
     conn = sqlite3.connect(str(db_path), timeout=10.0)
     conn.execute('PRAGMA busy_timeout = 5000')
     conn.execute('PRAGMA journal_mode = WAL')
 
+    # Auto-detect: check if embeddings are already quantized
+    quant_params = load_quantization_params(conn)
+    already_quantized = False
+    if quant_params:
+        test_size = packed_size(quant_params['dims'], quant_params['bit_width'])
+        sample = conn.execute(
+            'SELECT length(embedding) FROM chunks WHERE embedding IS NOT NULL LIMIT 1'
+        ).fetchone()
+        if sample and sample[0] == test_size:
+            already_quantized = True
+
+    if already_quantized and args.sidecar_only:
+        # Fast path: read packed vectors directly, dequantize for rerank matrix
+        print('Step 2: Load already-quantized embeddings')
+        dims = quant_params['dims']
+        bit_width = quant_params['bit_width']
+        seed = quant_params['rotation_seed']
+        codebook = quant_params['codebook']
+        model_name = quant_params['model_name']
+
+        rowids, packed_vectors, skipped = load_quantized_embeddings(conn, dims, bit_width)
+        print(f'  Loaded: {len(rowids)} packed vectors ({dims}d, {bit_width}-bit)')
+        if skipped:
+            print(f'  Skipped: {skipped} (wrong size or NULL)')
+        if not rowids:
+            print('  ERROR: No quantized embeddings found.')
+            conn.close()
+            sys.exit(1)
+
+        print()
+        print('Step 3: Dequantize for rerank matrix')
+        _, inv = generate_rotation(dims, seed)
+        start = time.time()
+        vectors = []
+        for i, packed in enumerate(packed_vectors):
+            deq = dequantize(packed, inv, codebook, dims)
+            norm = np.linalg.norm(deq)
+            if norm > 0:
+                deq = deq / norm
+            vectors.append(deq)
+            if (i + 1) % 10000 == 0:
+                print(f'  Dequantized {i + 1}/{len(packed_vectors)}', end='\r')
+        vectors = np.array(vectors, dtype=np.float32)
+        print(f'  Dequantized {len(vectors)} vectors in {time.time() - start:.1f}s')
+        print()
+
+        # Jump to sidecar writing
+        print(f'Step 4: Writing sidecar files to {db_path.parent}')
+        stats = write_sidecar_files(
+            db_path.parent, rowids, packed_vectors, vectors,
+            codebook, dims, bit_width, seed, model_name,
+        )
+        print(f'  packed_vectors.bin: {stats["packed_mb"]} MB')
+        print(f'  rerank_matrix.f32:  {stats["rerank_mb"]} MB')
+        print(f'  quantization.json:  {stats["meta_kb"]} KB')
+        conn.close()
+        print()
+        print('  Sidecar files written. Restart MCP server to use TurboQuantBackend.')
+        return
+
+    print('Step 2: Load float32 embeddings')
     rowids, vectors, skipped = load_float32_embeddings(conn, args.dims)
     print(f'  Loaded: {len(rowids)} vectors')
     if skipped:
