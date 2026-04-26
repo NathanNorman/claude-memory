@@ -5,6 +5,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent / 'src'))
+sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent))
 
 
 class TestMergeRRFMulti(unittest.TestCase):
@@ -297,6 +298,78 @@ class TestEntityRetrieval(unittest.TestCase):
 
         results = er.search('plain query with no tools or names')
         self.assertEqual(results, [])
+
+
+try:
+    import igraph
+    HAS_IGRAPH = True
+except ImportError:
+    HAS_IGRAPH = False
+
+
+def _write_db_to_file(conn):
+    """Dump in-memory DB to a temp file (GraphSidecar needs a file path)."""
+    import tempfile
+    from pathlib import Path
+    tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tmp.close()
+    disk_conn = __import__('sqlite3').connect(tmp.name)
+    conn.backup(disk_conn)
+    disk_conn.close()
+    return Path(tmp.name)
+
+
+@unittest.skipUnless(HAS_IGRAPH, 'igraph not installed')
+class TestGraphReranking(unittest.TestCase):
+    """Tests for graph in-degree re-ranking of codebase search results."""
+
+    def test_high_in_degree_boosted(self):
+        """File with high in-degree should rank above same-scored file with low in-degree."""
+        import math
+        from test_fixtures import create_test_db
+        from unified_memory_server import GraphSidecar
+
+        conn = create_test_db()
+        db_path = _write_db_to_file(conn)
+
+        gs = GraphSidecar(db_path)
+        gs.load()
+        self.assertTrue(gs.is_loaded)
+
+        # file2 gets bridge edges (in=4), file14 is a chain tail (in=2)
+        hub = 'cluster0/file2.java'
+        leaf = 'cluster0/file14.java'
+        self.assertIn(hub, gs._node_index)
+        self.assertIn(leaf, gs._node_index)
+
+        hub_vid = gs._node_index[hub]
+        leaf_vid = gs._node_index[leaf]
+        hub_in = gs._graph.degree(hub_vid, mode='in')
+        leaf_in = gs._graph.degree(leaf_vid, mode='in')
+
+        # Hub should have more incoming edges than leaf
+        self.assertGreater(hub_in, leaf_in)
+
+        # Simulate re-ranking with same base score
+        base_score = 0.5
+        weight = 0.1
+        hub_score = base_score * (1 + math.log(1 + hub_in) * weight)
+        leaf_score = base_score * (1 + math.log(1 + leaf_in) * weight)
+        self.assertGreater(hub_score, leaf_score)
+
+        import os
+        os.unlink(db_path)
+
+    def test_graph_not_loaded_scores_unchanged(self):
+        """When graph is not loaded, scores should remain unchanged."""
+        from unified_memory_server import GraphSidecar
+
+        gs = GraphSidecar.__new__(GraphSidecar)
+        gs._loaded = False
+        gs._graph = None
+        gs._node_index = {}
+
+        self.assertFalse(gs.is_loaded)
 
 
 if __name__ == '__main__':

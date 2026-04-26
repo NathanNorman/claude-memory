@@ -2472,6 +2472,23 @@ async def codebase_search(
     if not merged:
         merged = flat_hits
 
+    # Graph in-degree re-ranking: boost files with more incoming edges
+    if graph_sidecar and graph_sidecar.is_loaded:
+        weight = float(os.environ.get('GRAPH_RERANK_WEIGHT', '0.1'))
+        for r in merged:
+            fp = r['file_path']
+            # Strip codebase prefix: "codebase:name/rel/path" -> "rel/path"
+            if fp.startswith('codebase:'):
+                parts = fp.split('/', 1)
+                rel_path = parts[1] if len(parts) > 1 else fp
+            else:
+                rel_path = fp
+            if rel_path in graph_sidecar._node_index:
+                vid = graph_sidecar._node_index[rel_path]
+                in_deg = graph_sidecar._graph.degree(vid, mode='in')
+                r['score'] *= (1 + math.log(1 + in_deg) * weight)
+        merged.sort(key=lambda x: x.get('score', 0), reverse=True)
+
     results = []
     conn = flat_backend._ensure_conn()
     for r in merged[:maxResults]:
