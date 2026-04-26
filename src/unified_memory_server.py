@@ -315,6 +315,28 @@ class FlatSearchBackend:
             CREATE INDEX IF NOT EXISTS idx_chunk_entities_chunk
             ON chunk_entities(chunk_id)
         ''')
+        # Entity relationship table for co-occurrence graph
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS entity_relationships (
+                entity_a TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                entity_b TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0
+            )
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_entity_rel_a
+            ON entity_relationships(entity_a)
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_entity_rel_b
+            ON entity_relationships(entity_b)
+        ''')
+        self._conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_entity_rel_chunk
+            ON entity_relationships(chunk_id)
+        ''')
         self._conn.execute('ANALYZE')
         self._conn.commit()
 
@@ -545,6 +567,12 @@ class FlatSearchBackend:
                 )
             except Exception:
                 pass
+            try:
+                conn.execute(
+                    'DELETE FROM entity_relationships WHERE chunk_id = ?', (row['id'],)
+                )
+            except Exception:
+                pass
         conn.execute(
             'DELETE FROM chunks WHERE file_path = ?', (file_path_relative,)
         )
@@ -594,6 +622,16 @@ class FlatSearchBackend:
                     'INSERT INTO chunk_entities (chunk_id, entity_type, entity_value) '
                     'VALUES (?, ?, ?)',
                     (chunk_id, etype, evalue),
+                )
+
+            # Extract and store co-occurrence relationships
+            co_occurrences = extract_co_occurrences(entities, chunk_id)
+            for ea, eb, rel_type, cid in co_occurrences:
+                conn.execute(
+                    'INSERT INTO entity_relationships '
+                    '(entity_a, relation_type, entity_b, chunk_id) '
+                    'VALUES (?, ?, ?, ?)',
+                    (ea, rel_type, eb, cid),
                 )
 
         # Update files table (preserve existing summary)
@@ -2063,6 +2101,25 @@ def extract_entities(content: str, title: str) -> list[tuple[str, str]]:
             _add('person', name)
 
     return entities
+
+
+def extract_co_occurrences(
+    entities: list[tuple[str, str]], chunk_id: str,
+) -> list[tuple[str, str, str, str]]:
+    """Generate canonical co-occurrence pairs from a list of entities.
+
+    Returns list of (entity_a, entity_b, relation_type, chunk_id) tuples
+    where entity_a < entity_b (canonical ordering).
+    """
+    if len(entities) < 2:
+        return []
+
+    values = sorted({v for _, v in entities})
+    pairs = []
+    for i in range(len(values)):
+        for j in range(i + 1, len(values)):
+            pairs.append((values[i], values[j], 'co_occurrence', chunk_id))
+    return pairs
 
 
 def smart_truncate(text: str, max_len: int = 800) -> str:
