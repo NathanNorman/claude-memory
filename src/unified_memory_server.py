@@ -2285,6 +2285,95 @@ def _search_addon(
     return {'results': results}
 
 
+# ── Multi-hop retrieval helpers ──
+
+
+def _extract_pass2_entities(
+    results: list[dict], original_entities: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Extract new entities from top-5 Pass 1 results not in original query.
+
+    Returns list of (entity_type, entity_value) tuples for Pass 2 expansion.
+    """
+    original_set = {(t, v) for t, v in original_entities}
+    new_entities: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set(original_set)
+
+    for r in results[:5]:
+        content = r.get('content', '')
+        title = r.get('title', '')
+        for etype, evalue in extract_entities(content, title):
+            key = (etype, evalue)
+            if key not in seen:
+                seen.add(key)
+                new_entities.append(key)
+
+    return new_entities
+
+
+def _deep_search_pass2(
+    new_entities: list[tuple[str, str]], limit: int,
+) -> list[dict]:
+    """Run Pass 2 retrieval using expanded entities (entity + keyword only).
+
+    Skips vector and temporal signals to save ~500ms.
+    """
+    if not new_entities or not flat_backend or not entity_backend:
+        return []
+
+    # Entity retrieval with expanded entity set
+    entity_values = [v for _, v in new_entities]
+    conn = entity_backend._ensure_conn()
+    placeholders = ','.join('?' * len(entity_values))
+
+    entity_hits: list[dict] = []
+    try:
+        rows = conn.execute(
+            f'SELECT ce.chunk_id, COUNT(DISTINCT ce.entity_value) as overlap_count '
+            f'FROM chunk_entities ce '
+            f'WHERE ce.entity_value IN ({placeholders}) '
+            f'GROUP BY ce.chunk_id '
+            f'ORDER BY overlap_count DESC '
+            f'LIMIT ?',
+            (*entity_values, limit * 3),
+        ).fetchall()
+
+        if rows:
+            chunk_ids = [row['chunk_id'] for row in rows]
+            overlap_map = {row['chunk_id']: row['overlap_count'] for row in rows}
+            id_placeholders = ','.join('?' * len(chunk_ids))
+            chunks = conn.execute(
+                f'SELECT id, file_path, chunk_index, start_line, end_line, '
+                f'title, content FROM chunks WHERE id IN ({id_placeholders})',
+                chunk_ids,
+            ).fetchall()
+            for chunk in chunks:
+                overlap = overlap_map.get(chunk['id'], 0)
+                entity_hits.append({
+                    'id': chunk['id'],
+                    'file_path': chunk['file_path'],
+                    'chunk_index': chunk['chunk_index'],
+                    'start_line': chunk['start_line'],
+                    'end_line': chunk['end_line'],
+                    'title': chunk['title'],
+                    'content': chunk['content'],
+                    'score': overlap / len(new_entities),
+                })
+    except Exception as e:
+        log.warning(f'Pass 2 entity search failed: {e}')
+
+    # Keyword search using entity values as terms
+    keyword_query = ' '.join(entity_values[:10])  # Cap at 10 terms
+    keyword_hits: list[dict] = []
+    try:
+        keyword_hits = flat_backend.search_keyword(keyword_query, limit * 3)
+    except Exception as e:
+        log.warning(f'Pass 2 keyword search failed: {e}')
+
+    # RRF merge pass 2 signals
+    return FlatSearchBackend.merge_rrf_multi([entity_hits, keyword_hits])
+
+
 @mcp_app.tool()
 async def memory_search(
     query: str,
@@ -2450,6 +2539,160 @@ async def memory_search(
         filtered.append(entry)
 
     return {'results': filtered}
+
+
+@mcp_app.tool()
+async def memory_deep_search(
+    query: str,
+    maxResults: int = 10,
+    maxHops: int = 1,
+    minScore: float = 0,
+    after: str = '',
+    before: str = '',
+    project: str = '',
+    source: str = '',
+) -> dict:
+    """Multi-hop deep search that chains related documents for complex queries.
+
+    Pass 1 runs standard hybrid search (keyword + vector + temporal + entity).
+    Pass 2 extracts new entities from top results and searches again using
+    entity overlap + keyword only (no vector/temporal — saves ~500ms).
+    Results are merged via RRF and deduplicated.
+
+    Use this for queries that span multiple topics or require connecting
+    information across documents (e.g., "how did the auth migration affect
+    the deploy pipeline?").
+
+    Args:
+        query: Search query text
+        maxResults: Maximum results to return (default 10)
+        maxHops: Maximum expansion passes (default 1, max 2)
+        minScore: Minimum relevance score 0-1 (default 0)
+        after: Filter: only results after this date (YYYY-MM-DD)
+        before: Filter: only results before this date (YYYY-MM-DD)
+        project: Filter: only results from this project directory
+        source: Filter: "curated", "conversations", or empty for all
+    """
+    maxHops = min(max(0, maxHops), 2)
+
+    # Pass 1: reuse memory_search internals
+    pass1_result = await memory_search(
+        query=query, maxResults=maxResults * 2,
+        minScore=0, after=after, before=before,
+        project=project, source=source,
+    )
+    pass1_items = pass1_result.get('results', [])
+
+    # Tag Pass 1 results with hop=0
+    for item in pass1_items:
+        item['hop'] = 0
+
+    if maxHops == 0 or not pass1_items:
+        # No expansion — just return Pass 1
+        filtered = [r for r in pass1_items if r.get('score', 0) >= minScore]
+        return {
+            'results': filtered[:maxResults],
+            'hops_performed': 0,
+        }
+
+    # Extract entities from query for comparison
+    original_entities = extract_entities(query, '')
+
+    # Build pseudo-results with content for entity extraction
+    # (pass1_items are formatted results with 'snippet' not 'content')
+    pass1_for_extraction = [
+        {'content': r.get('snippet', ''), 'title': r.get('title', '')}
+        for r in pass1_items[:5]
+    ]
+
+    new_entities = _extract_pass2_entities(pass1_for_extraction, original_entities)
+
+    if not new_entities:
+        # No new entities found — skip Pass 2
+        filtered = [r for r in pass1_items if r.get('score', 0) >= minScore]
+        return {
+            'results': filtered[:maxResults],
+            'hops_performed': 0,
+        }
+
+    # Pass 2: entity + keyword search with expanded entities
+    pass2_raw = _deep_search_pass2(new_entities, maxResults)
+
+    # Dedup: track Pass 1 paths to tag appropriately
+    pass1_paths = {r.get('path', '') for r in pass1_items}
+
+    # Format Pass 2 results
+    pass2_items: list[dict] = []
+    norm_project = normalize_project(project) if project else ''
+    for r in pass2_raw:
+        fp = r['file_path']
+        is_conv = fp.startswith(CONV_PREFIX)
+        is_codebase = fp.startswith('codebase:')
+
+        # Source filter
+        if source == 'codebase' and not is_codebase:
+            continue
+        if source == 'curated' and (is_conv or is_codebase):
+            continue
+        if source == 'conversations' and not is_conv:
+            continue
+
+        path_key = (
+            fp.replace('conversations/', '').replace('.jsonl', '')
+            .split('/')[-1]
+            if is_conv else fp
+        )
+
+        # Skip if already in Pass 1 (dedup — mark as hop=0)
+        if path_key in pass1_paths:
+            continue
+
+        entry_date = None
+        entry_project = None
+        if is_conv:
+            meta = parse_chunk_title(r.get('title', ''))
+            entry_project = meta.get('project')
+            entry_date = meta.get('date')
+        else:
+            entry_date = date_from_path(fp)
+
+        # Date filter
+        if after and (not entry_date or entry_date < after):
+            continue
+        if before and (not entry_date or entry_date > before):
+            continue
+        if norm_project and is_conv:
+            if not entry_project or norm_project not in normalize_project(entry_project):
+                continue
+
+        entry: dict[str, Any] = {
+            'path': path_key,
+            'score': round(r.get('score', 0), 3),
+            'snippet': smart_truncate(r.get('content', ''), 800),
+            'hop': 1,
+        }
+        if not is_conv:
+            entry['startLine'] = r.get('start_line')
+            entry['endLine'] = r.get('end_line')
+        if is_conv:
+            if entry_project:
+                entry['project'] = normalize_project(entry_project)
+            if entry_date:
+                entry['date'] = entry_date
+
+        pass2_items.append(entry)
+
+    # Combine and sort by score
+    combined = pass1_items + pass2_items
+    combined.sort(key=lambda x: x.get('score', 0), reverse=True)
+
+    filtered = [r for r in combined if r.get('score', 0) >= minScore]
+    return {
+        'results': filtered[:maxResults],
+        'hops_performed': 1,
+        'pass2_entities': len(new_entities),
+        'pass2_results': len(pass2_items),
+    }
 
 
 @mcp_app.tool()

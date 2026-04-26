@@ -35,7 +35,7 @@ from unified_memory_server import (
 )
 
 CORPUS_PATH = Path(__file__).parent / 'corpus.json'
-VALID_SIGNALS = {'keyword', 'vector', 'temporal', 'entity'}
+VALID_SIGNALS = {'keyword', 'vector', 'temporal', 'entity', 'deep_search'}
 
 
 def load_corpus() -> dict:
@@ -263,6 +263,91 @@ def search_with_signals(
                     })
                 entity_hits.sort(key=lambda x: x['score'], reverse=True)
                 ranked_lists.append(entity_hits)
+
+    # Deep search (2-pass multi-hop): run standard signals first, then expand
+    if 'deep_search' in signals:
+        from unified_memory_server import _extract_pass2_entities, extract_entities as ee
+        # Pass 1 merge
+        if not ranked_lists:
+            return []
+        pass1 = FlatSearchBackend.merge_rrf_multi(ranked_lists)[:limit]
+
+        # Extract new entities from top-5 pass 1 results
+        original_entities = ee(query, '')
+        pass1_for_extraction = [
+            {'content': r.get('content', ''), 'title': r.get('title', '')}
+            for r in pass1[:5]
+        ]
+        new_entities = _extract_pass2_entities(pass1_for_extraction, original_entities)
+
+        if new_entities:
+            # Pass 2: entity + keyword only
+            entity_values = [v for _, v in new_entities]
+
+            # Entity overlap for pass 2
+            placeholders = ','.join('?' * len(entity_values))
+            p2_entity_hits = []
+            try:
+                rows = conn.execute(
+                    f'SELECT ce.chunk_id, COUNT(DISTINCT ce.entity_value) as overlap '
+                    f'FROM chunk_entities ce '
+                    f'WHERE ce.entity_value IN ({placeholders}) '
+                    f'GROUP BY ce.chunk_id ORDER BY overlap DESC LIMIT ?',
+                    (*entity_values, limit * 3),
+                ).fetchall()
+                if rows:
+                    qe_count = len(new_entities)
+                    chunk_ids = [r['chunk_id'] for r in rows]
+                    overlap_map = {r['chunk_id']: r['overlap'] for r in rows}
+                    id_ph = ','.join('?' * len(chunk_ids))
+                    chunks = conn.execute(
+                        f'SELECT id, file_path, chunk_index, start_line, end_line, '
+                        f'title, content FROM chunks WHERE id IN ({id_ph})',
+                        chunk_ids,
+                    ).fetchall()
+                    for c in chunks:
+                        p2_entity_hits.append({
+                            'id': c['id'], 'file_path': c['file_path'],
+                            'chunk_index': c['chunk_index'],
+                            'start_line': c['start_line'],
+                            'end_line': c['end_line'],
+                            'title': c['title'], 'content': c['content'],
+                            'score': overlap_map.get(c['id'], 0) / qe_count,
+                        })
+            except Exception:
+                pass
+
+            # Keyword for pass 2
+            kw_query = ' '.join(entity_values[:10])
+            p2_kw = ' OR '.join(f'"{w}"' for w in kw_query.split() if len(w) > 2)
+            p2_keyword_hits = []
+            if p2_kw:
+                try:
+                    rows = conn.execute(
+                        'SELECT c.id, c.file_path, c.chunk_index, c.start_line, '
+                        'c.end_line, c.title, c.content, '
+                        'bm25(chunks_fts, 1.0, 0.5) as score '
+                        'FROM chunks_fts fts JOIN chunks c ON c.rowid = fts.rowid '
+                        'WHERE chunks_fts MATCH ? ORDER BY score LIMIT ?',
+                        (p2_kw, limit * 3),
+                    ).fetchall()
+                    p2_keyword_hits = [{
+                        'id': r['id'], 'file_path': r['file_path'],
+                        'chunk_index': r['chunk_index'],
+                        'start_line': r['start_line'], 'end_line': r['end_line'],
+                        'title': r['title'], 'content': r['content'],
+                        'score': abs(r['score']),
+                    } for r in rows]
+                except Exception:
+                    pass
+
+            pass2 = FlatSearchBackend.merge_rrf_multi([p2_entity_hits, p2_keyword_hits])
+
+            # Merge pass 1 + pass 2 via RRF, dedup by ID
+            combined = FlatSearchBackend.merge_rrf_multi([pass1, pass2])
+            return combined[:limit]
+
+        return pass1[:limit]
 
     # RRF merge
     if not ranked_lists:

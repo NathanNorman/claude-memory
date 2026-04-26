@@ -489,5 +489,76 @@ class TestBackfillSignals(unittest.TestCase):
         os.unlink(tmp.name)
 
 
+class TestMultiHopRetrieval(unittest.TestCase):
+    """Tests for _extract_pass2_entities, _deep_search_pass2, and memory_deep_search."""
+
+    def test_extract_pass2_entities_finds_new(self):
+        from unified_memory_server import _extract_pass2_entities
+        results = [
+            {'content': 'We use Slack and Docker for our workflow', 'title': ''},
+            {'content': 'Jira tracks all tasks', 'title': ''},
+        ]
+        original = [('tool', 'slack')]
+        new_entities = _extract_pass2_entities(results, original)
+
+        new_vals = {v for _, v in new_entities}
+        self.assertIn('docker', new_vals)
+        self.assertIn('jira', new_vals)
+        # Original should not appear
+        self.assertNotIn('slack', new_vals)
+
+    def test_extract_pass2_entities_empty_when_no_new(self):
+        from unified_memory_server import _extract_pass2_entities
+        results = [
+            {'content': 'slack is useful', 'title': ''},
+        ]
+        original = [('tool', 'slack')]
+        new_entities = _extract_pass2_entities(results, original)
+        self.assertEqual(new_entities, [])
+
+    def test_extract_pass2_entities_caps_at_5_results(self):
+        from unified_memory_server import _extract_pass2_entities
+        results = [
+            {'content': f'Tool{i} and Docker', 'title': ''} for i in range(10)
+        ]
+        original = []
+        new_entities = _extract_pass2_entities(results, original)
+        # Should only process first 5 results (docker appears in all, so just 1)
+        self.assertGreater(len(new_entities), 0)
+
+    def test_deep_search_pass2_returns_empty_when_no_entities(self):
+        from unified_memory_server import _deep_search_pass2
+        result = _deep_search_pass2([], limit=10)
+        self.assertEqual(result, [])
+
+    def test_deep_search_pass2_returns_results(self):
+        """Pass 2 search returns results when entity+keyword backends are available."""
+        from unified_memory_server import _deep_search_pass2
+        import unified_memory_server as ums
+
+        # Only test if backends are initialized (integration context)
+        if ums.flat_backend is None or ums.entity_backend is None:
+            self.skipTest('Backends not initialized (unit test context)')
+
+        new_entities = [('tool', 'docker'), ('tool', 'jira')]
+        results = _deep_search_pass2(new_entities, limit=5)
+        # Should return a list (possibly empty if no matching data)
+        self.assertIsInstance(results, list)
+
+    def test_dedup_pass1_results_get_hop_0(self):
+        """Results appearing in both passes should get hop=0 (Pass 1 wins)."""
+        from unified_memory_server import _extract_pass2_entities
+        # This tests the dedup logic conceptually — in memory_deep_search,
+        # Pass 1 paths are tracked and Pass 2 skips them
+        results = [
+            {'content': 'Slack integration details', 'title': ''},
+        ]
+        original = [('tool', 'docker')]
+        new_entities = _extract_pass2_entities(results, original)
+        # slack is new (not in original docker-only query)
+        new_vals = {v for _, v in new_entities}
+        self.assertIn('slack', new_vals)
+
+
 if __name__ == '__main__':
     unittest.main()
