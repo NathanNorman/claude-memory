@@ -1379,7 +1379,187 @@ class VectorSearchBackend:
 
 
 # ──────────────────────────────────────────────────────────────
-# Section 1c: GraphSidecar — igraph in-process graph queries
+# Section 1c: Temporal & Entity Retrieval
+# ──────────────────────────────────────────────────────────────
+
+import math
+
+
+def parse_temporal_query(query: str) -> str | None:
+    """Extract a date reference from a search query.
+
+    Returns YYYY-MM-DD string or None if no temporal reference found.
+    """
+    # Check for ISO date first
+    m = _ISO_DATE_RE.search(query)
+    if m:
+        return m.group(1)
+
+    # Check for English date
+    m = _ENGLISH_DATE_RE.search(query)
+    if m:
+        try:
+            from dateparser import parse as dp_parse
+            parsed = dp_parse(m.group(1))
+            if parsed:
+                return parsed.strftime('%Y-%m-%d')
+        except ImportError:
+            pass
+
+    # Check for relative date expressions
+    m = _RELATIVE_DATE_WORDS.search(query)
+    if m:
+        try:
+            from dateparser import parse as dp_parse
+            parsed = dp_parse(m.group(1))
+            if parsed:
+                return parsed.strftime('%Y-%m-%d')
+        except ImportError:
+            pass
+
+    return None
+
+
+class TemporalRetrieval:
+    """Temporal proximity scoring for memory search.
+
+    Scores chunks by Gaussian decay from a query's temporal reference.
+    sigma=7 days: chunks within a week score high, beyond 2 weeks very low.
+    """
+
+    def __init__(self, db_path: Path):
+        self._db_path = db_path
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def _ensure_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(str(self._db_path), timeout=5.0)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute('PRAGMA busy_timeout = 5000')
+        return self._conn
+
+    def search(self, query: str, limit: int = 50) -> list[dict]:
+        """Score chunks by temporal proximity to query date.
+
+        Returns empty list if no date found in query.
+        """
+        center_date = parse_temporal_query(query)
+        if not center_date:
+            return []
+
+        conn = self._ensure_conn()
+        rows = conn.execute(
+            'SELECT id, file_path, chunk_index, start_line, end_line, '
+            'title, content, event_date FROM chunks '
+            'WHERE event_date IS NOT NULL '
+            'ORDER BY ABS(julianday(event_date) - julianday(?)) '
+            'LIMIT ?',
+            (center_date, limit * 3),
+        ).fetchall()
+
+        results = []
+        for row in rows:
+            try:
+                event_dt = datetime.strptime(row['event_date'], '%Y-%m-%d')
+                center_dt = datetime.strptime(center_date, '%Y-%m-%d')
+                days = abs((event_dt - center_dt).days)
+                # Gaussian decay: sigma=7 days
+                score = math.exp(-(days ** 2) / 98.0)
+                if score < 0.01:
+                    continue
+                results.append({
+                    'id': row['id'],
+                    'file_path': row['file_path'],
+                    'chunk_index': row['chunk_index'],
+                    'start_line': row['start_line'],
+                    'end_line': row['end_line'],
+                    'title': row['title'],
+                    'content': row['content'],
+                    'score': score,
+                })
+            except (ValueError, TypeError):
+                continue
+
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results[:limit]
+
+
+class EntityRetrieval:
+    """Entity overlap scoring for memory search.
+
+    Scores chunks by how many query entities they share.
+    """
+
+    def __init__(self, db_path: Path):
+        self._db_path = db_path
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def _ensure_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(str(self._db_path), timeout=5.0)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute('PRAGMA busy_timeout = 5000')
+        return self._conn
+
+    def search(self, query: str, limit: int = 50) -> list[dict]:
+        """Score chunks by entity overlap with query.
+
+        Returns empty list if no entities found in query.
+        """
+        query_entities = extract_entities(query, '')
+        if not query_entities:
+            return []
+
+        conn = self._ensure_conn()
+        entity_values = [v for _, v in query_entities]
+        placeholders = ','.join('?' * len(entity_values))
+
+        rows = conn.execute(
+            f'SELECT ce.chunk_id, COUNT(DISTINCT ce.entity_value) as overlap_count '
+            f'FROM chunk_entities ce '
+            f'WHERE ce.entity_value IN ({placeholders}) '
+            f'GROUP BY ce.chunk_id '
+            f'ORDER BY overlap_count DESC '
+            f'LIMIT ?',
+            (*entity_values, limit),
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        query_entity_count = len(query_entities)
+        chunk_ids = [row['chunk_id'] for row in rows]
+        overlap_map = {row['chunk_id']: row['overlap_count'] for row in rows}
+
+        # Fetch chunk content
+        id_placeholders = ','.join('?' * len(chunk_ids))
+        chunks = conn.execute(
+            f'SELECT id, file_path, chunk_index, start_line, end_line, '
+            f'title, content FROM chunks WHERE id IN ({id_placeholders})',
+            chunk_ids,
+        ).fetchall()
+
+        results = []
+        for chunk in chunks:
+            overlap = overlap_map.get(chunk['id'], 0)
+            score = overlap / query_entity_count
+            results.append({
+                'id': chunk['id'],
+                'file_path': chunk['file_path'],
+                'chunk_index': chunk['chunk_index'],
+                'start_line': chunk['start_line'],
+                'end_line': chunk['end_line'],
+                'title': chunk['title'],
+                'content': chunk['content'],
+                'score': score,
+            })
+
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results[:limit]
+
+
+# ──────────────────────────────────────────────────────────────
+# Section 1d: GraphSidecar — igraph in-process graph queries
 # ──────────────────────────────────────────────────────────────
 
 
@@ -2037,6 +2217,8 @@ mcp_app = FastMCP(
 # Backends (initialized at startup)
 flat_backend: Optional[FlatSearchBackend] = None
 vector_backend: Optional[VectorSearchBackend] = None
+temporal_backend: Optional[TemporalRetrieval] = None
+entity_backend: Optional[EntityRetrieval] = None
 
 
 def _search_addon(
@@ -2136,8 +2318,24 @@ async def memory_search(
         except Exception as e:
             log.warning(f'Vector search failed: {e}')
 
-    # Merge keyword + vector via RRF (N-way: additional signals added below)
-    ranked_lists = [flat_original, vector_hits]
+    # Temporal proximity signal
+    temporal_hits: list[dict] = []
+    if temporal_backend and source != 'codebase':
+        try:
+            temporal_hits = temporal_backend.search(query, fetch_limit * 2)
+        except Exception as e:
+            log.warning(f'Temporal search failed: {e}')
+
+    # Entity overlap signal
+    entity_hits: list[dict] = []
+    if entity_backend and source != 'codebase':
+        try:
+            entity_hits = entity_backend.search(query, fetch_limit * 2)
+        except Exception as e:
+            log.warning(f'Entity search failed: {e}')
+
+    # Merge all signals via N-way RRF
+    ranked_lists = [flat_original, vector_hits, temporal_hits, entity_hits]
     merged = FlatSearchBackend.merge_rrf_multi(ranked_lists)
     if not merged:
         merged = flat_original
@@ -3282,7 +3480,7 @@ async def index_session(
 
 
 async def run() -> None:
-    global flat_backend, vector_backend, graph_sidecar
+    global flat_backend, vector_backend, graph_sidecar, temporal_backend, entity_backend
 
     # Initialize flat backend
     try:
@@ -3312,6 +3510,14 @@ async def run() -> None:
     except Exception as e:
         log.warning(f'Vector backend init failed: {e}')
         vector_backend = None
+
+    # Initialize temporal and entity retrieval backends
+    try:
+        temporal_backend = TemporalRetrieval(DB_PATH)
+        entity_backend = EntityRetrieval(DB_PATH)
+        log.info('Temporal and entity retrieval backends ready')
+    except Exception as e:
+        log.warning(f'Temporal/entity backend init failed: {e}')
 
     # Initialize graph sidecar (igraph for fast traversal)
     try:

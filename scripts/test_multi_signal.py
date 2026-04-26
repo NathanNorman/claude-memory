@@ -176,5 +176,128 @@ class TestExtractEntities(unittest.TestCase):
         self.assertEqual(persons, [])
 
 
+class TestTemporalRetrieval(unittest.TestCase):
+    """Tests for TemporalRetrieval search-time scoring."""
+
+    def _setup_db(self):
+        """Create an in-memory DB with chunks that have event_date."""
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute('''
+            CREATE TABLE chunks (
+                id TEXT PRIMARY KEY, file_path TEXT, chunk_index INTEGER,
+                start_line INTEGER, end_line INTEGER, title TEXT,
+                content TEXT, embedding BLOB, hash TEXT,
+                updated_at INTEGER, event_date TEXT
+            )
+        ''')
+        # Insert chunks with dates spread across January 2025
+        for day in range(1, 21):
+            date_str = f'2025-01-{day:02d}'
+            conn.execute(
+                'INSERT INTO chunks VALUES (?, ?, 0, 0, 10, ?, ?, NULL, ?, 0, ?)',
+                (f'chunk-{day}', f'memory/{date_str}.md', f'Day {day}',
+                 f'Content from {date_str}', f'hash{day}', date_str),
+            )
+        conn.commit()
+        return conn
+
+    def test_query_with_date_ranks_nearby_highest(self):
+        from unified_memory_server import TemporalRetrieval
+        conn = self._setup_db()
+        tr = TemporalRetrieval.__new__(TemporalRetrieval)
+        tr._db_path = None
+        tr._conn = conn
+
+        results = tr.search('what happened on 2025-01-10', limit=20)
+        self.assertGreater(len(results), 0)
+        # The chunk for Jan 10 should be ranked first or very high
+        self.assertEqual(results[0]['id'], 'chunk-10')
+        # Jan 9 and Jan 11 should be next (1 day away = high score)
+        nearby_ids = {r['id'] for r in results[:3]}
+        self.assertIn('chunk-9', nearby_ids)
+        self.assertIn('chunk-11', nearby_ids)
+
+    def test_query_without_date_returns_empty(self):
+        from unified_memory_server import TemporalRetrieval
+        conn = self._setup_db()
+        tr = TemporalRetrieval.__new__(TemporalRetrieval)
+        tr._db_path = None
+        tr._conn = conn
+
+        results = tr.search('generic query no date')
+        self.assertEqual(results, [])
+
+
+class TestEntityRetrieval(unittest.TestCase):
+    """Tests for EntityRetrieval search-time scoring."""
+
+    def _setup_db(self):
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute('''
+            CREATE TABLE chunks (
+                id TEXT PRIMARY KEY, file_path TEXT, chunk_index INTEGER,
+                start_line INTEGER, end_line INTEGER, title TEXT,
+                content TEXT, embedding BLOB, hash TEXT, updated_at INTEGER
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE chunk_entities (
+                chunk_id TEXT NOT NULL, entity_type TEXT NOT NULL,
+                entity_value TEXT NOT NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX idx_chunk_entities_value ON chunk_entities(entity_value)')
+
+        # Chunk with both slack and jira
+        conn.execute(
+            'INSERT INTO chunks VALUES (?, ?, 0, 0, 10, ?, ?, NULL, ?, 0)',
+            ('chunk-both', 'memory/2025-01-01.md', 'Both tools',
+             'Uses slack and jira', 'h1'),
+        )
+        conn.execute('INSERT INTO chunk_entities VALUES (?, ?, ?)',
+                     ('chunk-both', 'tool', 'slack'))
+        conn.execute('INSERT INTO chunk_entities VALUES (?, ?, ?)',
+                     ('chunk-both', 'tool', 'jira'))
+
+        # Chunk with only slack
+        conn.execute(
+            'INSERT INTO chunks VALUES (?, ?, 0, 0, 10, ?, ?, NULL, ?, 0)',
+            ('chunk-one', 'memory/2025-01-02.md', 'One tool',
+             'Uses slack only', 'h2'),
+        )
+        conn.execute('INSERT INTO chunk_entities VALUES (?, ?, ?)',
+                     ('chunk-one', 'tool', 'slack'))
+
+        conn.commit()
+        return conn
+
+    def test_multi_entity_query_ranks_multi_match_higher(self):
+        from unified_memory_server import EntityRetrieval
+        conn = self._setup_db()
+        er = EntityRetrieval.__new__(EntityRetrieval)
+        er._db_path = None
+        er._conn = conn
+
+        results = er.search('slack and jira integration')
+        self.assertGreater(len(results), 0)
+        # chunk-both has 2/2 overlap, chunk-one has 1/2
+        self.assertEqual(results[0]['id'], 'chunk-both')
+        self.assertGreater(results[0]['score'], results[1]['score'])
+
+    def test_no_entities_returns_empty(self):
+        from unified_memory_server import EntityRetrieval
+        conn = self._setup_db()
+        er = EntityRetrieval.__new__(EntityRetrieval)
+        er._db_path = None
+        er._conn = conn
+
+        results = er.search('plain query with no tools or names')
+        self.assertEqual(results, [])
+
+
 if __name__ == '__main__':
     unittest.main()
