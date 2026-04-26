@@ -74,7 +74,7 @@ function rebuildFts(db: DatabaseType): void {
 function rebuildVec(db: DatabaseType): void {
   console.log('       Rebuilding chunks_vec...');
   db.exec('DROP TABLE IF EXISTS chunks_vec');
-  db.exec('CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[384])');
+  db.exec('CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[768])');
   const rows = db.prepare('SELECT rowid, embedding FROM chunks WHERE embedding IS NOT NULL').all() as Array<{
     rowid: number;
     embedding: Buffer;

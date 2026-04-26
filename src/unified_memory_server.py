@@ -1085,41 +1085,18 @@ class VectorSearchBackend:
             if norm > 0:
                 query_vec = query_vec / norm
 
-        if self._quantized and self._packed_list:
-            from quantize import dequantize
-
-            query_rotated = self._rotate_fn(query_vec)
-            approx_sims = batch_quantized_dot_products(
-                query_rotated, self._packed_list, self._codebook,
-                self.EMBEDDING_DIMS,
-            )
-            rerank_k = max(self.RERANK_K, limit * 3)
-            rerank_k = min(rerank_k, len(approx_sims))
-            candidate_indices = np.argsort(approx_sims)[-rerank_k:]
-
-            candidate_vecs = []
-            for ci in candidate_indices:
-                deq = dequantize(
-                    self._packed_list[ci], self._inv_rotate_fn,
-                    self._codebook, self.EMBEDDING_DIMS,
-                )
-                norm = np.linalg.norm(deq)
-                if norm > 0:
-                    deq = deq / norm
-                candidate_vecs.append(deq)
-            candidate_matrix = np.array(candidate_vecs, dtype=np.float32)
-
-            exact_sims = candidate_matrix @ query_vec
-            top_within = np.argsort(exact_sims)[-limit:][::-1]
-            top_indices = [candidate_indices[j] for j in top_within]
-            similarities = np.array([exact_sims[j] for j in top_within])
-        else:
+        # Codebase embeddings are always float32 (different model/dims than
+        # memory embeddings), so skip the quantized path entirely to avoid
+        # dimension mismatch between codebase query and memory packed vectors.
+        if self._matrix is not None:
             query_vec_2d = query_vec.reshape(1, -1)
             all_sims = (self._matrix @ query_vec_2d.T).flatten()
             top_k = min(limit, len(all_sims))
             top_indices = np.argpartition(all_sims, -top_k)[-top_k:]
             top_indices = top_indices[np.argsort(all_sims[top_indices])[::-1]]
             similarities = all_sims[top_indices]
+        else:
+            return []
 
         conn = self._ensure_conn()
         if conn is None:
