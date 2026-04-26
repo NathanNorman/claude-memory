@@ -2859,11 +2859,13 @@ async def dependency_search(
     or what a file depends on.
 
     Args:
-        file_path: Relative file path within the codebase (e.g., "src/main/java/.../Foo.java")
+        file_path: Relative file path within the codebase, or a repo name for repo_depends_on/repo_depended_on_by.
         codebase: Codebase name (e.g., "toast-analytics"). Empty = search all codebases.
         direction: "imported_by" = find files that import this file (reverse deps),
                    "imports" = find files this file imports (forward deps),
-                   "depended_on_by" = find build_dependency edges where metadata matches file_path
+                   "depended_on_by" = find build_dependency edges where metadata matches file_path,
+                   "repo_depends_on" = find repo_dependency edges where source_file matches (what does this repo depend on?),
+                   "repo_depended_on_by" = find repo_dependency edges where target_file matches (who depends on this artifact?)
         edge_type: Filter by edge type (e.g., "calls", "extends", "build_dependency"). Empty = all.
         maxResults: Maximum results to return (default 50)
     """
@@ -2872,10 +2874,68 @@ async def dependency_search(
 
     conn = flat_backend._ensure_conn()
 
+    if direction == 'repo_depends_on':
+        # Forward repo dependency: what does this repo depend on?
+        query = "SELECT target_file, edge_type, metadata, codebase FROM edges WHERE source_file = ? AND edge_type = 'repo_dependency'"
+        params: list = [file_path]
+        if codebase:
+            query += ' AND codebase = ?'
+            params.append(codebase)
+        query += f' LIMIT {int(maxResults)}'
+        try:
+            rows = conn.execute(query, params).fetchall()
+        except Exception as e:
+            return {'error': str(e), 'results': []}
+        results = []
+        for row in rows:
+            if row[0] is None:
+                continue
+            entry: dict[str, Any] = {
+                'dependency': row[0],
+                'edge_type': row[1],
+                'metadata': row[2],
+            }
+            if not codebase:
+                entry['codebase'] = row[3]
+            results.append(entry)
+        return {
+            'file': file_path,
+            'direction': direction,
+            'count': len(results),
+            'results': results,
+        }
+
+    if direction == 'repo_depended_on_by':
+        # Reverse repo dependency: who depends on this artifact?
+        query = "SELECT source_file, edge_type, metadata, codebase FROM edges WHERE target_file LIKE ? AND edge_type = 'repo_dependency'"
+        params = [f'%{file_path}%']
+        query += f' LIMIT {int(maxResults)}'
+        try:
+            rows = conn.execute(query, params).fetchall()
+        except Exception as e:
+            return {'error': str(e), 'results': []}
+        results = []
+        for row in rows:
+            if row[0] is None:
+                continue
+            entry = {
+                'repo': row[0],
+                'edge_type': row[1],
+                'metadata': row[2],
+                'codebase': row[3],
+            }
+            results.append(entry)
+        return {
+            'artifact': file_path,
+            'direction': direction,
+            'count': len(results),
+            'results': results,
+        }
+
     if direction == 'depended_on_by':
         # Reverse build dependency lookup: find who depends on this artifact
         query = 'SELECT source_file, edge_type, metadata, codebase FROM edges WHERE metadata LIKE ? AND edge_type = ?'
-        params: list = [f'%{file_path}%', 'build_dependency']
+        params = [f'%{file_path}%', 'build_dependency']
     elif direction == 'imports':
         query = 'SELECT target_file, edge_type, metadata, codebase FROM edges WHERE source_file = ?'
         params = [file_path]
