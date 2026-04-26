@@ -372,5 +372,122 @@ class TestGraphReranking(unittest.TestCase):
         self.assertFalse(gs.is_loaded)
 
 
+class TestBackfillSignals(unittest.TestCase):
+    """Tests for backfill_signals.py."""
+
+    def test_backfill_on_in_memory_db(self):
+        """Backfill should populate event_date and entities for existing chunks."""
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        # Create a temp DB with some chunks
+        tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        tmp.close()
+        conn = sqlite3.connect(tmp.name)
+        conn.row_factory = sqlite3.Row
+        conn.execute('''
+            CREATE TABLE chunks (
+                id TEXT PRIMARY KEY, file_path TEXT, chunk_index INTEGER,
+                start_line INTEGER, end_line INTEGER, title TEXT,
+                content TEXT, embedding BLOB, hash TEXT, updated_at INTEGER
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE files (
+                file_path TEXT PRIMARY KEY, content_hash TEXT,
+                last_indexed TEXT, chunk_count INTEGER, summary TEXT
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)
+        ''')
+        # Chunk with ISO date and tool mention
+        conn.execute(
+            'INSERT INTO chunks VALUES (?, ?, 0, 0, 10, ?, ?, NULL, ?, 0)',
+            ('c1', 'memory/2025-03-15.md', 'Test chunk',
+             'We deployed to Slack on 2025-03-15', 'h1'),
+        )
+        # Chunk with no date
+        conn.execute(
+            'INSERT INTO chunks VALUES (?, ?, 0, 0, 10, ?, ?, NULL, ?, 0)',
+            ('c2', 'notes/random.md', 'No date',
+             'Just some notes with no tools', 'h2'),
+        )
+        conn.commit()
+        conn.close()
+
+        from backfill_signals import backfill
+        stats = backfill(Path(tmp.name))
+
+        self.assertEqual(stats['chunks_processed'], 2)
+        self.assertGreaterEqual(stats['dates_found'], 1)
+
+        # Verify DB state
+        conn = sqlite3.connect(tmp.name)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            'SELECT event_date FROM chunks WHERE id = ?', ('c1',)
+        ).fetchone()
+        self.assertEqual(row['event_date'], '2025-03-15')
+
+        entities = conn.execute(
+            'SELECT entity_type, entity_value FROM chunk_entities WHERE chunk_id = ?',
+            ('c1',),
+        ).fetchall()
+        tool_vals = [r['entity_value'] for r in entities if r['entity_type'] == 'tool']
+        self.assertIn('slack', tool_vals)
+
+        conn.close()
+        import os
+        os.unlink(tmp.name)
+
+    def test_backfill_idempotent(self):
+        """Running backfill twice should not duplicate entities."""
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        tmp.close()
+        conn = sqlite3.connect(tmp.name)
+        conn.execute('''
+            CREATE TABLE chunks (
+                id TEXT PRIMARY KEY, file_path TEXT, chunk_index INTEGER,
+                start_line INTEGER, end_line INTEGER, title TEXT,
+                content TEXT, embedding BLOB, hash TEXT, updated_at INTEGER
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE files (
+                file_path TEXT PRIMARY KEY, content_hash TEXT,
+                last_indexed TEXT, chunk_count INTEGER, summary TEXT
+            )
+        ''')
+        conn.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
+        conn.execute(
+            'INSERT INTO chunks VALUES (?, ?, 0, 0, 10, ?, ?, NULL, ?, 0)',
+            ('c1', 'memory/2025-01-01.md', 'Test', 'Using Jira today', 'h1'),
+        )
+        conn.commit()
+        conn.close()
+
+        from backfill_signals import backfill
+        stats1 = backfill(Path(tmp.name))
+        stats2 = backfill(Path(tmp.name))
+
+        # Second run should find 0 new dates (already populated)
+        self.assertEqual(stats2['chunks_processed'], 0)
+
+        # Entity count should not increase
+        conn = sqlite3.connect(tmp.name)
+        entity_count = conn.execute('SELECT COUNT(*) FROM chunk_entities').fetchone()[0]
+        conn.close()
+        self.assertEqual(entity_count, stats1['entities_found'])
+
+        import os
+        os.unlink(tmp.name)
+
+
 if __name__ == '__main__':
     unittest.main()
