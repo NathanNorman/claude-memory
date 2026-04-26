@@ -6,10 +6,10 @@ dependency edges and stores them in the unified-memory edges table.
 
 Usage:
     source ~/.claude-memory/graphiti-venv/bin/activate
-    python3 scripts/cross-repo-deps.py --path ~/toast-analytics --name toast-analytics
-    python3 scripts/cross-repo-deps.py --path ~/toast-analytics --name toast-analytics --update
-    python3 scripts/cross-repo-deps.py --list
-    python3 scripts/cross-repo-deps.py --remove --name toast-analytics
+    python3 scripts/cross_repo_deps.py --path ~/toast-analytics --name toast-analytics
+    python3 scripts/cross_repo_deps.py --path ~/toast-analytics --name toast-analytics --update
+    python3 scripts/cross_repo_deps.py --list
+    python3 scripts/cross_repo_deps.py --remove --name toast-analytics
 """
 
 import argparse

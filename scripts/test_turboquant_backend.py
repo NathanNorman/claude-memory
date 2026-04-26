@@ -1,9 +1,7 @@
 #!/Users/nathan.norman/.pyenv/versions/3.12.11/bin/python3
 """Tests for TurboQuantBackend sidecar integration."""
 
-import hashlib
 import json
-import os
 import sqlite3
 import struct
 import sys

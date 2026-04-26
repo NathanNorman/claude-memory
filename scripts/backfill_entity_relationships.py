@@ -8,7 +8,7 @@ Idempotent: clears entity_relationships table before re-populating.
 
 Usage:
     source ~/.claude-memory/graphiti-venv/bin/activate
-    python3 scripts/backfill-entity-relationships.py [--db PATH]
+    python3 scripts/backfill_entity_relationships.py [--db PATH]
 """
 
 import argparse

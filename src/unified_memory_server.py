@@ -2732,19 +2732,26 @@ async def memory_search(
     flat_original = flat_backend.search_keyword(query, fetch_limit * 2)
 
     # Vector similarity search — synchronous, first call loads model (~2s), then fast
-    # Prefer TurboQuant sidecar backend if loaded (faster at scale)
+    # When TurboQuant is active, also run float32 to catch recently written chunks
+    # (sidecar files are static — new writes only appear in SQLite BLOBs)
     # Use codebase model with query prefix when searching codebase source
     vector_hits: list[dict] = []
     if turboquant_backend and turboquant_backend.is_loaded and source != 'codebase':
         try:
             vector_hits = turboquant_backend.search(query, fetch_limit * 2)
         except Exception as e:
-            log.warning(f'TurboQuant search failed, falling back to float32: {e}')
-            if vector_backend:
-                try:
-                    vector_hits = vector_backend.search(query, fetch_limit * 2)
-                except Exception as e2:
-                    log.warning(f'Vector search also failed: {e2}')
+            log.warning(f'TurboQuant search failed: {e}')
+        # Supplement with float32 to catch newly written (un-sidecar'd) chunks
+        if vector_backend:
+            try:
+                float32_hits = vector_backend.search(query, fetch_limit)
+                if float32_hits:
+                    # Merge: TurboQuant results + float32 supplement
+                    vector_hits = FlatSearchBackend.merge_rrf_multi(
+                        [vector_hits, float32_hits]
+                    )
+            except Exception:
+                pass  # float32 supplement is best-effort
     elif vector_backend:
         try:
             if source == 'codebase':
