@@ -560,5 +560,183 @@ class TestMultiHopRetrieval(unittest.TestCase):
         self.assertIn('slack', new_vals)
 
 
+class TestExtractCoOccurrences(unittest.TestCase):
+    """Tests for extract_co_occurrences()."""
+
+    def test_pair_generation(self):
+        from unified_memory_server import extract_co_occurrences
+        entities = [('tool', 'slack'), ('tool', 'jira'), ('person', 'alice')]
+        pairs = extract_co_occurrences(entities, 'chunk-1')
+        # 3 entities → 3 pairs (C(3,2))
+        self.assertEqual(len(pairs), 3)
+        # All should be co_occurrence type
+        for ea, eb, rel_type, cid in pairs:
+            self.assertEqual(rel_type, 'co_occurrence')
+            self.assertEqual(cid, 'chunk-1')
+            self.assertLess(ea, eb)  # Canonical ordering
+
+    def test_single_entity_returns_empty(self):
+        from unified_memory_server import extract_co_occurrences
+        entities = [('tool', 'slack')]
+        pairs = extract_co_occurrences(entities, 'chunk-1')
+        self.assertEqual(pairs, [])
+
+    def test_empty_entities_returns_empty(self):
+        from unified_memory_server import extract_co_occurrences
+        pairs = extract_co_occurrences([], 'chunk-1')
+        self.assertEqual(pairs, [])
+
+    def test_dedup_entity_values(self):
+        from unified_memory_server import extract_co_occurrences
+        # Same value, different type — should dedup by value
+        entities = [('tool', 'slack'), ('project', 'slack')]
+        pairs = extract_co_occurrences(entities, 'chunk-1')
+        # Only 1 unique value → 0 pairs
+        self.assertEqual(pairs, [])
+
+
+class TestEntityRelationshipIntegration(unittest.TestCase):
+    """Integration tests for entity relationships, entity_browse, entity_graph."""
+
+    def _setup_db(self):
+        """Create an in-memory DB with entities and co-occurrences."""
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute('''
+            CREATE TABLE chunks (
+                id TEXT PRIMARY KEY, file_path TEXT, chunk_index INTEGER,
+                start_line INTEGER, end_line INTEGER, title TEXT,
+                content TEXT, embedding BLOB, hash TEXT,
+                updated_at INTEGER, event_date TEXT
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE chunk_entities (
+                chunk_id TEXT NOT NULL, entity_type TEXT NOT NULL,
+                entity_value TEXT NOT NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX idx_chunk_entities_value ON chunk_entities(entity_value)')
+        conn.execute('CREATE INDEX idx_chunk_entities_chunk ON chunk_entities(chunk_id)')
+        conn.execute('''
+            CREATE TABLE entity_relationships (
+                entity_a TEXT NOT NULL, relation_type TEXT NOT NULL,
+                entity_b TEXT NOT NULL, chunk_id TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0
+            )
+        ''')
+        conn.execute('CREATE INDEX idx_entity_rel_a ON entity_relationships(entity_a)')
+        conn.execute('CREATE INDEX idx_entity_rel_b ON entity_relationships(entity_b)')
+
+        # Chunk 1: slack + jira
+        conn.execute(
+            'INSERT INTO chunks VALUES (?, ?, 0, 0, 10, ?, ?, NULL, ?, 0, NULL)',
+            ('c1', 'memory/2025-01-01.md', 'Both tools', 'Uses slack and jira', 'h1'),
+        )
+        conn.execute('INSERT INTO chunk_entities VALUES (?, ?, ?)', ('c1', 'tool', 'slack'))
+        conn.execute('INSERT INTO chunk_entities VALUES (?, ?, ?)', ('c1', 'tool', 'jira'))
+        conn.execute(
+            'INSERT INTO entity_relationships VALUES (?, ?, ?, ?, ?)',
+            ('jira', 'co_occurrence', 'slack', 'c1', 1.0),
+        )
+
+        # Chunk 2: slack + docker
+        conn.execute(
+            'INSERT INTO chunks VALUES (?, ?, 0, 0, 10, ?, ?, NULL, ?, 0, NULL)',
+            ('c2', 'memory/2025-01-02.md', 'Slack Docker', 'Using slack with docker', 'h2'),
+        )
+        conn.execute('INSERT INTO chunk_entities VALUES (?, ?, ?)', ('c2', 'tool', 'slack'))
+        conn.execute('INSERT INTO chunk_entities VALUES (?, ?, ?)', ('c2', 'tool', 'docker'))
+        conn.execute(
+            'INSERT INTO entity_relationships VALUES (?, ?, ?, ?, ?)',
+            ('docker', 'co_occurrence', 'slack', 'c2', 1.0),
+        )
+
+        # Chunk 3: docker + github (for depth-2 test)
+        conn.execute(
+            'INSERT INTO chunks VALUES (?, ?, 0, 0, 10, ?, ?, NULL, ?, 0, NULL)',
+            ('c3', 'memory/2025-01-03.md', 'Docker GH', 'Docker and github CI', 'h3'),
+        )
+        conn.execute('INSERT INTO chunk_entities VALUES (?, ?, ?)', ('c3', 'tool', 'docker'))
+        conn.execute('INSERT INTO chunk_entities VALUES (?, ?, ?)', ('c3', 'tool', 'github'))
+        conn.execute(
+            'INSERT INTO entity_relationships VALUES (?, ?, ?, ?, ?)',
+            ('docker', 'co_occurrence', 'github', 'c3', 1.0),
+        )
+
+        conn.commit()
+        return conn
+
+    def test_entity_browse_all(self):
+        """entity_browse with no filters returns all entities sorted by count."""
+        conn = self._setup_db()
+        rows = conn.execute(
+            'SELECT entity_value, entity_type, COUNT(*) as count '
+            'FROM chunk_entities '
+            'GROUP BY entity_value, entity_type ORDER BY count DESC',
+        ).fetchall()
+
+        # slack appears 2x, docker 2x, jira 1x, github 1x
+        by_val = {r['entity_value']: r['count'] for r in rows}
+        self.assertEqual(by_val['slack'], 2)
+        self.assertEqual(by_val['docker'], 2)
+        self.assertEqual(by_val['jira'], 1)
+        self.assertEqual(by_val['github'], 1)
+
+    def test_entity_browse_filter_type(self):
+        """entity_browse filtered by type returns only matching entities."""
+        conn = self._setup_db()
+        rows = conn.execute(
+            'SELECT entity_value, entity_type, COUNT(*) as count '
+            'FROM chunk_entities WHERE entity_type = ? '
+            'GROUP BY entity_value, entity_type ORDER BY count DESC',
+            ('tool',),
+        ).fetchall()
+        self.assertEqual(len(rows), 4)  # all are tools
+
+    def test_entity_graph_depth_1(self):
+        """entity_graph depth 1 for slack returns jira and docker."""
+        conn = self._setup_db()
+        rows = conn.execute(
+            'SELECT CASE WHEN entity_a = ? THEN entity_b ELSE entity_a END as neighbor, '
+            'COUNT(*) as co_occurrence_count '
+            'FROM entity_relationships '
+            'WHERE entity_a = ? OR entity_b = ? '
+            'GROUP BY neighbor '
+            'ORDER BY co_occurrence_count DESC',
+            ('slack', 'slack', 'slack'),
+        ).fetchall()
+
+        neighbors = {r['neighbor'] for r in rows}
+        self.assertIn('jira', neighbors)
+        self.assertIn('docker', neighbors)
+        self.assertEqual(len(neighbors), 2)
+
+    def test_entity_graph_depth_2(self):
+        """entity_graph depth 2 for slack should reach github via docker."""
+        conn = self._setup_db()
+        # Depth 1: slack → {jira, docker}
+        d1_rows = conn.execute(
+            'SELECT CASE WHEN entity_a = ? THEN entity_b ELSE entity_a END as neighbor '
+            'FROM entity_relationships '
+            'WHERE entity_a = ? OR entity_b = ? '
+            'GROUP BY neighbor',
+            ('slack', 'slack', 'slack'),
+        ).fetchall()
+        d1_set = {'slack'} | {r['neighbor'] for r in d1_rows}
+
+        # Depth 2 via docker: docker → {slack, github}, github is new
+        d2_rows = conn.execute(
+            'SELECT CASE WHEN entity_a = ? THEN entity_b ELSE entity_a END as neighbor '
+            'FROM entity_relationships '
+            'WHERE entity_a = ? OR entity_b = ? '
+            'GROUP BY neighbor',
+            ('docker', 'docker', 'docker'),
+        ).fetchall()
+        d2_new = {r['neighbor'] for r in d2_rows} - d1_set
+        self.assertIn('github', d2_new)
+
+
 if __name__ == '__main__':
     unittest.main()

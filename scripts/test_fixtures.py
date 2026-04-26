@@ -84,6 +84,20 @@ def create_test_db(
     conn.execute('CREATE INDEX IF NOT EXISTS idx_chunk_entities_value ON chunk_entities(entity_value)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_chunk_entities_chunk ON chunk_entities(chunk_id)')
 
+    # --- Entity relationships table ---
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS entity_relationships (
+            entity_a TEXT NOT NULL,
+            relation_type TEXT NOT NULL,
+            entity_b TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            confidence REAL DEFAULT 1.0
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_entity_rel_a ON entity_relationships(entity_a)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_entity_rel_b ON entity_relationships(entity_b)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_entity_rel_chunk ON entity_relationships(chunk_id)')
+
     # --- Dependency tables (from _ensure_dep_tables) ---
     conn.execute('''
         CREATE TABLE IF NOT EXISTS edges (
