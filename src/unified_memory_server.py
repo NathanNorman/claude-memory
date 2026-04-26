@@ -1385,6 +1385,13 @@ class VectorSearchBackend:
 import math
 
 
+_MONTH_YEAR_RE = re.compile(
+    r'\b((?:January|February|March|April|May|June|July|August|September|'
+    r'October|November|December)\s+\d{4})\b',
+    re.IGNORECASE,
+)
+
+
 def parse_temporal_query(query: str) -> str | None:
     """Extract a date reference from a search query.
 
@@ -1395,7 +1402,7 @@ def parse_temporal_query(query: str) -> str | None:
     if m:
         return m.group(1)
 
-    # Check for English date
+    # Check for English date (Month DD, YYYY)
     m = _ENGLISH_DATE_RE.search(query)
     if m:
         try:
@@ -1403,6 +1410,18 @@ def parse_temporal_query(query: str) -> str | None:
             parsed = dp_parse(m.group(1))
             if parsed:
                 return parsed.strftime('%Y-%m-%d')
+        except ImportError:
+            pass
+
+    # Check for Month YYYY (e.g., "March 2025" -> mid-month)
+    m = _MONTH_YEAR_RE.search(query)
+    if m:
+        try:
+            from dateparser import parse as dp_parse
+            parsed = dp_parse(m.group(1))
+            if parsed:
+                # Use the 15th as center for month-level queries
+                return parsed.replace(day=15).strftime('%Y-%m-%d')
         except ImportError:
             pass
 

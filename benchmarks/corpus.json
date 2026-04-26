@@ -1,0 +1,556 @@
+{
+  "documents": [
+    {
+      "id": "d1", "file_path": "memory/2025-01-10.md",
+      "title": "toast-analytics | 2025-01-10 | Tools: Read, Write",
+      "content": "Deployed new Spark job for materialization pipeline. Nathan Norman reviewed the PR. Fixed OOM error in aggregation step by increasing executor memory to 8g.",
+      "event_date": "2025-01-10"
+    },
+    {
+      "id": "d2", "file_path": "memory/2025-01-15.md",
+      "title": "toast-analytics | 2025-01-15 | Tools: Bash, Read",
+      "content": "Investigated Datadog alerts for high latency in toast-analytics queries. Root cause was missing partition pruning in Spark SQL. Added WHERE clause on event_date.",
+      "event_date": "2025-01-15"
+    },
+    {
+      "id": "d3", "file_path": "memory/2025-02-01.md",
+      "title": "claude-memory | 2025-02-01 | Tools: Edit, Write",
+      "content": "Implemented FTS5 search backend for claude-memory. Added chunking by markdown headings and BM25 scoring. Tested with 500 memory files.",
+      "event_date": "2025-02-01"
+    },
+    {
+      "id": "d4", "file_path": "memory/2025-02-10.md",
+      "title": "claude-memory | 2025-02-10 | Tools: Read, Bash",
+      "content": "Added vector search using sentence-transformers all-MiniLM-L6-v2. Hybrid RRF merge combines keyword and vector results. Embeddings stored as BLOBs in SQLite.",
+      "event_date": "2025-02-10"
+    },
+    {
+      "id": "d5", "file_path": "memory/2025-02-20.md",
+      "title": "personal-docs | 2025-02-20 | Tools: Write",
+      "content": "Set up GitHub Pages for personal-docs. Used MDX format with Docusaurus. Configured deploy workflow with GitHub Actions.",
+      "event_date": "2025-02-20"
+    },
+    {
+      "id": "d6", "file_path": "memory/2025-03-01.md",
+      "title": "toast-analytics | 2025-03-01 | Tools: Read, Bash",
+      "content": "Created Jira ticket DATA-1234 for backfill of missing restaurant dimensions. Sarah Chen provided requirements. Estimated 2 weeks for implementation.",
+      "event_date": "2025-03-01"
+    },
+    {
+      "id": "d7", "file_path": "memory/2025-03-05.md",
+      "title": "toast-analytics | 2025-03-05 | Tools: Bash, Read",
+      "content": "Slack discussion with David Kim about Grafana dashboard for pipeline latency. Agreed to add SLO alerting via Datadog monitors.",
+      "event_date": "2025-03-05"
+    },
+    {
+      "id": "d8", "file_path": "memory/2025-03-10.md",
+      "title": "toast-analytics | 2025-03-10 | Tools: Edit, Write",
+      "content": "Finished Terraform module for analytics Lambda deployment. Cross-account IAM roles for preproduction-analytics to access Glue catalog in preproduction account.",
+      "event_date": "2025-03-10"
+    },
+    {
+      "id": "d9", "file_path": "memory/2025-03-15.md",
+      "title": "claude-memory | 2025-03-15 | Tools: Read, Edit",
+      "content": "Added conversation preservation to indexer. Conversation chunks are never pruned even when JSONL files are deleted. This is the only surviving copy of session knowledge.",
+      "event_date": "2025-03-15"
+    },
+    {
+      "id": "d10", "file_path": "memory/2025-03-20.md",
+      "title": "claude-memory | 2025-03-20 | Tools: Bash, Write",
+      "content": "Built addon reference database system. Skills can ship pre-built .db files. Discovery follows Claude Code skill resolution. Source routing prevents cross-contamination.",
+      "event_date": "2025-03-20"
+    },
+    {
+      "id": "d11", "file_path": "memory/2025-03-25.md",
+      "title": "toast-analytics | 2025-03-25 | Tools: Read",
+      "content": "Production incident: Airflow DAG for daily materialization failed due to Spark version mismatch after EMR upgrade. Rolled back to Spark 3.4. Nathan Norman led the incident response.",
+      "event_date": "2025-03-25"
+    },
+    {
+      "id": "d12", "file_path": "memory/2025-04-01.md",
+      "title": "toast-analytics | 2025-04-01 | Tools: Bash, Edit",
+      "content": "Migrated Zeppelin notebooks to new cluster. Updated JDBC connections and Spark configs. Validated all 12 scheduled notebooks run correctly.",
+      "event_date": "2025-04-01"
+    },
+    {
+      "id": "d13", "file_path": "memory/2025-04-05.md",
+      "title": "personal-docs | 2025-04-05 | Tools: Write",
+      "content": "Wrote technical blog post about building MCP servers with Python. Published on personal-docs site. Got positive feedback from colleagues on Slack.",
+      "event_date": "2025-04-05"
+    },
+    {
+      "id": "d14", "file_path": "memory/2025-04-10.md",
+      "title": "claude-memory | 2025-04-10 | Tools: Read, Edit",
+      "content": "Added igraph dependency graph for codebase indexing. SCIP parser extracts imports/calls edges. Community detection via Louvain clustering.",
+      "event_date": "2025-04-10"
+    },
+    {
+      "id": "d15", "file_path": "memory/2025-04-15.md",
+      "title": "toast-analytics | 2025-04-15 | Tools: Bash",
+      "content": "Sourcegraph search revealed 15 repos importing our shared analytics library. Coordinated with David Kim and Sarah Chen on deprecation timeline for v1 API.",
+      "event_date": "2025-04-15"
+    },
+    {
+      "id": "d16", "file_path": "memory/2025-04-20.md",
+      "title": "claude-memory | 2025-04-20 | Tools: Edit, Write",
+      "content": "Implemented webhook pipeline for GitHub push events. Added timing instrumentation for indexing latency. Optimized chunk embedding to batch 32 at a time.",
+      "event_date": "2025-04-20"
+    },
+    {
+      "id": "d17", "file_path": "conversations/abc123.jsonl:0",
+      "title": "toast-analytics | 2025-01-12 | Tools: Bash, Read",
+      "content": "Debugged Splunk query for order analytics. Found the index was toast-pos-transactions not toast-analytics. Fixed the SPL and got latency data.",
+      "event_date": "2025-01-12"
+    },
+    {
+      "id": "d18", "file_path": "conversations/def456.jsonl:0",
+      "title": "claude-memory | 2025-02-05 | Tools: Edit",
+      "content": "Refactored embedding cache to use content hash as key. Avoids re-embedding unchanged content across reindexes. Saved 40% reindex time.",
+      "event_date": "2025-02-05"
+    },
+    {
+      "id": "d19", "file_path": "conversations/ghi789.jsonl:0",
+      "title": "toast-analytics | 2025-03-12 | Tools: Bash",
+      "content": "AWS oktoast authentication issue. Needed bedrock profile for Claude Code but was using preproduction. Tokens expire after 1 hour vs 12 hours for bedrock.",
+      "event_date": "2025-03-12"
+    },
+    {
+      "id": "d20", "file_path": "conversations/jkl012.jsonl:0",
+      "title": "toast-analytics | 2025-04-08 | Tools: Read, Write",
+      "content": "Built DataHub lineage visualization for toast-analytics pipeline. Shows upstream dependencies from raw S3 to final Glue tables. Sarah Chen validated accuracy.",
+      "event_date": "2025-04-08"
+    },
+    {
+      "id": "d21", "file_path": "memory/2025-01-20.md",
+      "title": "toast-analytics | 2025-01-20 | Tools: Bash",
+      "content": "Performance tuning: reduced Spark shuffle partitions from 200 to 50 for small datasets. Query time dropped from 45s to 12s. Applied to all daily materializations.",
+      "event_date": "2025-01-20"
+    },
+    {
+      "id": "d22", "file_path": "memory/2025-02-15.md",
+      "title": "claude-memory | 2025-02-15 | Tools: Read",
+      "content": "Designed mtime-based staleness detection for incremental indexing. File mtime compared against DB timestamp. O(file_count) not O(DB_size). Fast startup.",
+      "event_date": "2025-02-15"
+    },
+    {
+      "id": "d23", "file_path": "memory/2025-03-08.md",
+      "title": "toast-analytics | 2025-03-08 | Tools: Edit",
+      "content": "Code review with Nathan Norman on the new dbt model for restaurant metrics. Suggested using incremental strategy instead of full refresh. Approved after fixes.",
+      "event_date": "2025-03-08"
+    },
+    {
+      "id": "d24", "file_path": "memory/2025-04-12.md",
+      "title": "toast-analytics | 2025-04-12 | Tools: Bash, Read",
+      "content": "Jira ticket DATA-1567: Kubernetes pod OOM kills on analytics worker. Increased memory limits from 4Gi to 8Gi. Monitored via Datadog container metrics.",
+      "event_date": "2025-04-12"
+    },
+    {
+      "id": "d25", "file_path": "memory/2025-01-25.md",
+      "title": "personal-docs | 2025-01-25 | Tools: Write",
+      "content": "Created project documentation template for personal-docs. Includes architecture diagrams, setup instructions, and troubleshooting guide sections.",
+      "event_date": "2025-01-25"
+    },
+    {
+      "id": "d26", "file_path": "memory/2025-02-25.md",
+      "title": "claude-memory | 2025-02-25 | Tools: Bash, Edit",
+      "content": "Implemented reindex.lock file for concurrent session safety. O_CREAT|O_EXCL ensures only one indexer runs. Stale locks auto-reclaimed after 5 minutes.",
+      "event_date": "2025-02-25"
+    },
+    {
+      "id": "d27", "file_path": "conversations/mno345.jsonl:0",
+      "title": "toast-analytics | 2025-02-08 | Tools: Read",
+      "content": "Discussed migration plan with Sarah Chen for moving from Redshift to Spark on EMR. Timeline: 6 weeks. Key risk: SQL compatibility for existing queries.",
+      "event_date": "2025-02-08"
+    },
+    {
+      "id": "d28", "file_path": "conversations/pqr678.jsonl:0",
+      "title": "claude-memory | 2025-03-18 | Tools: Edit, Write",
+      "content": "Added SessionEnd hook for automatic reindexing after each Claude Code session. Uses Popen with detached process to avoid blocking session exit.",
+      "event_date": "2025-03-18"
+    },
+    {
+      "id": "d29", "file_path": "memory/2025-04-18.md",
+      "title": "toast-analytics | 2025-04-18 | Tools: Read, Bash",
+      "content": "Coordinated with David Kim on Slack about deprecating the old analytics REST API. Sent announcement to #data-platform channel. Migration deadline: May 15.",
+      "event_date": "2025-04-18"
+    },
+    {
+      "id": "d30", "file_path": "memory/2025-01-05.md",
+      "title": "toast-analytics | 2025-01-05 | Tools: Read",
+      "content": "Onboarding to toast-analytics codebase. Reviewed Glue catalog schema, S3 data layout, and existing Terraform modules. Met with team lead for context.",
+      "event_date": "2025-01-05"
+    },
+    {
+      "id": "d31", "file_path": "memory/2025-02-18.md",
+      "title": "claude-memory | 2025-02-18 | Tools: Write",
+      "content": "Built Python MCP server using FastMCP. Stdio transport for Claude Code integration. Four tools: memory_search, memory_read, memory_write, get_status.",
+      "event_date": "2025-02-18"
+    },
+    {
+      "id": "d32", "file_path": "memory/2025-03-28.md",
+      "title": "toast-analytics | 2025-03-28 | Tools: Bash",
+      "content": "Splunk investigation of pipeline failures. Found DNS resolution errors caused by VPN disconnection. Documented VPN check procedure for troubleshooting guide.",
+      "event_date": "2025-03-28"
+    },
+    {
+      "id": "d33", "file_path": "conversations/stu901.jsonl:0",
+      "title": "personal-docs | 2025-04-02 | Tools: Read, Write",
+      "content": "Set up Cloudflare analytics for personal-docs site. Configured page rules and caching. Traffic mostly from GitHub referrals.",
+      "event_date": "2025-04-02"
+    },
+    {
+      "id": "d34", "file_path": "memory/2025-04-22.md",
+      "title": "claude-memory | 2025-04-22 | Tools: Edit",
+      "content": "Added LLM semantic labeling for code symbols. Uses Claude to generate human-readable descriptions of functions and classes. Stored in symbols.metadata JSON.",
+      "event_date": "2025-04-22"
+    },
+    {
+      "id": "d35", "file_path": "memory/2025-01-28.md",
+      "title": "toast-analytics | 2025-01-28 | Tools: Bash, Read",
+      "content": "Debugged cross-account IAM issue. Lambda in analytics account (286547960662) couldn't access Glue in preproduction (620354051118). Fixed trust policy.",
+      "event_date": "2025-01-28"
+    },
+    {
+      "id": "d36", "file_path": "memory/2025-03-22.md",
+      "title": "claude-memory | 2025-03-22 | Tools: Read, Bash",
+      "content": "Added codebase indexing support. Python script scans repos, chunks source files, generates embeddings. Incremental updates via content hash comparison.",
+      "event_date": "2025-03-22"
+    },
+    {
+      "id": "d37", "file_path": "conversations/vwx234.jsonl:0",
+      "title": "toast-analytics | 2025-01-18 | Tools: Bash",
+      "content": "Helped David Kim troubleshoot Gradle build failures. Artifactory was unreachable due to VPN being disconnected. Reconnected with pritunl-vpn connect.",
+      "event_date": "2025-01-18"
+    },
+    {
+      "id": "d38", "file_path": "memory/2025-02-28.md",
+      "title": "toast-analytics | 2025-02-28 | Tools: Edit, Write",
+      "content": "Created new Airflow DAG for weekly aggregation. Uses SparkSubmitOperator with dynamic allocation. Scheduled every Sunday at 2am UTC.",
+      "event_date": "2025-02-28"
+    },
+    {
+      "id": "d39", "file_path": "conversations/yza567.jsonl:0",
+      "title": "claude-memory | 2025-04-14 | Tools: Read",
+      "content": "Investigated slow memory_search queries. Problem was full table scan on chunks without FTS5. Added proper FTS5 query building with prefix matching.",
+      "event_date": "2025-04-14"
+    },
+    {
+      "id": "d40", "file_path": "memory/2025-04-25.md",
+      "title": "claude-memory | 2025-04-25 | Tools: Edit, Bash",
+      "content": "Started multi-signal retrieval project. Added N-way RRF merge, temporal scoring, entity overlap, and graph re-ranking. Benchmark harness next.",
+      "event_date": "2025-04-25"
+    },
+    {
+      "id": "d41", "file_path": "memory/2025-01-08.md",
+      "title": "toast-analytics | 2025-01-08 | Tools: Read",
+      "content": "Reviewed existing Spark jobs in toast-analytics. Found 8 materializations running daily, 3 weekly. All use query_manifest.json for configuration.",
+      "event_date": "2025-01-08"
+    },
+    {
+      "id": "d42", "file_path": "memory/2025-02-12.md",
+      "title": "claude-memory | 2025-02-12 | Tools: Edit",
+      "content": "Implemented exchange-aware chunking for conversation archives. User/assistant pairs never split across chunks. Improves retrieval coherence.",
+      "event_date": "2025-02-12"
+    },
+    {
+      "id": "d43", "file_path": "memory/2025-03-30.md",
+      "title": "toast-analytics | 2025-03-30 | Tools: Bash, Read",
+      "content": "AWS cost review for analytics accounts. Found unused EMR clusters in preproduction costing $2k/month. Terminated and updated Terraform to prevent recreation.",
+      "event_date": "2025-03-30"
+    },
+    {
+      "id": "d44", "file_path": "conversations/bcd890.jsonl:0",
+      "title": "toast-analytics | 2025-02-22 | Tools: Bash",
+      "content": "Pair programming with Sarah Chen on new materialization for order metrics. Used SparkSQL with window functions for running totals. Tested against sample data.",
+      "event_date": "2025-02-22"
+    },
+    {
+      "id": "d45", "file_path": "memory/2025-04-08.md",
+      "title": "personal-docs | 2025-04-08 | Tools: Write",
+      "content": "Added architecture decision records (ADRs) section to personal-docs. Documented choices for MCP transport, embedding model selection, and database schema.",
+      "event_date": "2025-04-08"
+    },
+    {
+      "id": "d46", "file_path": "conversations/efg123.jsonl:0",
+      "title": "claude-memory | 2025-03-05 | Tools: Read, Edit",
+      "content": "Fixed race condition in concurrent memory writes. Added busy_timeout=5000ms for SQLite. WAL mode already enabled. No more SQLITE_BUSY errors.",
+      "event_date": "2025-03-05"
+    },
+    {
+      "id": "d47", "file_path": "memory/2025-01-30.md",
+      "title": "toast-analytics | 2025-01-30 | Tools: Read",
+      "content": "Met with product team about new restaurant performance dashboard. Requirements: daily refresh, last 90 days, drill-down by market. Will use existing Glue tables.",
+      "event_date": "2025-01-30"
+    },
+    {
+      "id": "d48", "file_path": "memory/2025-02-22.md",
+      "title": "toast-analytics | 2025-02-22 | Tools: Bash, Edit",
+      "content": "Set up Databricks workspace for POC in account 189462097194. Note: this is NOT the analytics account. Used for data science experiments only.",
+      "event_date": "2025-02-22"
+    },
+    {
+      "id": "d49", "file_path": "conversations/hij456.jsonl:0",
+      "title": "toast-analytics | 2025-04-03 | Tools: Read",
+      "content": "Investigated missing data in Grafana dashboard. Found that Terraform had accidentally removed the Glue crawler schedule. Re-added and triggered manual crawl.",
+      "event_date": "2025-04-03"
+    },
+    {
+      "id": "d50", "file_path": "memory/2025-04-16.md",
+      "title": "claude-memory | 2025-04-16 | Tools: Bash, Write",
+      "content": "Added community detection using Louvain algorithm from igraph. Groups related files into clusters. Stored in communities table with codebase scope.",
+      "event_date": "2025-04-16"
+    }
+  ],
+  "queries": [
+    {
+      "id": "q1", "category": "temporal",
+      "query": "what happened on 2025-01-10",
+      "relevant_ids": ["d1"]
+    },
+    {
+      "id": "q2", "category": "temporal",
+      "query": "what did we work on in early January 2025",
+      "relevant_ids": ["d30", "d41", "d1", "d17"]
+    },
+    {
+      "id": "q3", "category": "temporal",
+      "query": "work from 2025-03-15",
+      "relevant_ids": ["d9"]
+    },
+    {
+      "id": "q4", "category": "temporal",
+      "query": "what happened around March 2025",
+      "relevant_ids": ["d6", "d7", "d8", "d9", "d10", "d11", "d23", "d19", "d46", "d32", "d28"]
+    },
+    {
+      "id": "q5", "category": "temporal",
+      "query": "work done on 2025-04-10",
+      "relevant_ids": ["d14"]
+    },
+    {
+      "id": "q6", "category": "temporal",
+      "query": "what happened in February 2025",
+      "relevant_ids": ["d3", "d4", "d22", "d42", "d18", "d5", "d31", "d26", "d27", "d38", "d48", "d44"]
+    },
+    {
+      "id": "q7", "category": "temporal",
+      "query": "activities on 2025-01-28",
+      "relevant_ids": ["d35"]
+    },
+    {
+      "id": "q8", "category": "temporal",
+      "query": "what was done on 2025-04-20",
+      "relevant_ids": ["d16"]
+    },
+    {
+      "id": "q9", "category": "temporal",
+      "query": "late April 2025 work",
+      "relevant_ids": ["d40", "d34", "d29"]
+    },
+    {
+      "id": "q10", "category": "temporal",
+      "query": "work around 2025-02-10",
+      "relevant_ids": ["d4", "d42"]
+    },
+    {
+      "id": "q11", "category": "temporal",
+      "query": "what happened on 2025-03-25",
+      "relevant_ids": ["d11"]
+    },
+    {
+      "id": "q12", "category": "temporal",
+      "query": "activities in the first week of April 2025",
+      "relevant_ids": ["d12", "d33", "d49", "d13"]
+    },
+    {
+      "id": "q13", "category": "entity",
+      "query": "Datadog monitoring and alerts",
+      "relevant_ids": ["d2", "d7", "d24"]
+    },
+    {
+      "id": "q14", "category": "entity",
+      "query": "Sarah Chen work",
+      "relevant_ids": ["d6", "d27", "d44", "d20"]
+    },
+    {
+      "id": "q15", "category": "entity",
+      "query": "Slack discussions",
+      "relevant_ids": ["d7", "d13", "d29"]
+    },
+    {
+      "id": "q16", "category": "entity",
+      "query": "Jira tickets and issues",
+      "relevant_ids": ["d6", "d24"]
+    },
+    {
+      "id": "q17", "category": "entity",
+      "query": "David Kim collaboration",
+      "relevant_ids": ["d7", "d15", "d29", "d37"]
+    },
+    {
+      "id": "q18", "category": "entity",
+      "query": "Terraform infrastructure",
+      "relevant_ids": ["d8", "d43", "d49"]
+    },
+    {
+      "id": "q19", "category": "entity",
+      "query": "Splunk log investigation",
+      "relevant_ids": ["d17", "d32"]
+    },
+    {
+      "id": "q20", "category": "entity",
+      "query": "Grafana dashboard work",
+      "relevant_ids": ["d7", "d49"]
+    },
+    {
+      "id": "q21", "category": "entity",
+      "query": "Sourcegraph code search",
+      "relevant_ids": ["d15"]
+    },
+    {
+      "id": "q22", "category": "entity",
+      "query": "Nathan Norman reviews and work",
+      "relevant_ids": ["d1", "d11", "d23"]
+    },
+    {
+      "id": "q23", "category": "entity",
+      "query": "Kubernetes container issues",
+      "relevant_ids": ["d24"]
+    },
+    {
+      "id": "q24", "category": "entity",
+      "query": "Zeppelin notebook management",
+      "relevant_ids": ["d12"]
+    },
+    {
+      "id": "q25", "category": "general",
+      "query": "how does hybrid search work in claude-memory",
+      "relevant_ids": ["d3", "d4"]
+    },
+    {
+      "id": "q26", "category": "general",
+      "query": "Spark performance optimization",
+      "relevant_ids": ["d1", "d2", "d21"]
+    },
+    {
+      "id": "q27", "category": "general",
+      "query": "conversation indexing and preservation",
+      "relevant_ids": ["d9", "d42"]
+    },
+    {
+      "id": "q28", "category": "general",
+      "query": "IAM cross-account access",
+      "relevant_ids": ["d8", "d35"]
+    },
+    {
+      "id": "q29", "category": "general",
+      "query": "MCP server implementation",
+      "relevant_ids": ["d31", "d13"]
+    },
+    {
+      "id": "q30", "category": "general",
+      "query": "embedding model and vector search",
+      "relevant_ids": ["d4", "d18", "d16"]
+    },
+    {
+      "id": "q31", "category": "general",
+      "query": "VPN connectivity troubleshooting",
+      "relevant_ids": ["d32", "d37"]
+    },
+    {
+      "id": "q32", "category": "general",
+      "query": "SQLite concurrency and locking",
+      "relevant_ids": ["d26", "d46"]
+    },
+    {
+      "id": "q33", "category": "general",
+      "query": "Airflow DAG scheduling",
+      "relevant_ids": ["d11", "d38"]
+    },
+    {
+      "id": "q34", "category": "general",
+      "query": "incremental indexing strategy",
+      "relevant_ids": ["d22", "d36"]
+    },
+    {
+      "id": "q35", "category": "general",
+      "query": "AWS cost management",
+      "relevant_ids": ["d43"]
+    },
+    {
+      "id": "q36", "category": "general",
+      "query": "GitHub Actions deployment",
+      "relevant_ids": ["d5"]
+    },
+    {
+      "id": "q37", "category": "multi-hop",
+      "query": "What Spark issues did we have in January and how were they fixed",
+      "relevant_ids": ["d1", "d21", "d41"]
+    },
+    {
+      "id": "q38", "category": "multi-hop",
+      "query": "Sarah Chen involvement in toast-analytics materializations",
+      "relevant_ids": ["d6", "d27", "d44"]
+    },
+    {
+      "id": "q39", "category": "multi-hop",
+      "query": "How did claude-memory search evolve from keyword to hybrid",
+      "relevant_ids": ["d3", "d4", "d39"]
+    },
+    {
+      "id": "q40", "category": "multi-hop",
+      "query": "David Kim and Slack channel communication about analytics",
+      "relevant_ids": ["d7", "d29"]
+    },
+    {
+      "id": "q41", "category": "multi-hop",
+      "query": "production incidents and rollbacks in toast-analytics",
+      "relevant_ids": ["d11", "d32", "d49"]
+    },
+    {
+      "id": "q42", "category": "multi-hop",
+      "query": "Datadog and Grafana monitoring setup for pipeline",
+      "relevant_ids": ["d2", "d7", "d24", "d49"]
+    },
+    {
+      "id": "q43", "category": "multi-hop",
+      "query": "igraph and community detection in claude-memory codebase",
+      "relevant_ids": ["d14", "d50"]
+    },
+    {
+      "id": "q44", "category": "multi-hop",
+      "query": "cross-account AWS authentication issues with analytics",
+      "relevant_ids": ["d8", "d19", "d35"]
+    },
+    {
+      "id": "q45", "category": "multi-hop",
+      "query": "personal-docs site setup and content creation",
+      "relevant_ids": ["d5", "d25", "d13", "d45", "d33"]
+    },
+    {
+      "id": "q46", "category": "multi-hop",
+      "query": "Nathan Norman code reviews and incident response",
+      "relevant_ids": ["d1", "d11", "d23"]
+    },
+    {
+      "id": "q47", "category": "multi-hop",
+      "query": "Terraform modules for analytics Lambda and EMR",
+      "relevant_ids": ["d8", "d43"]
+    },
+    {
+      "id": "q48", "category": "multi-hop",
+      "query": "VPN issues affecting builds and log searches",
+      "relevant_ids": ["d32", "d37"]
+    },
+    {
+      "id": "q49", "category": "multi-hop",
+      "query": "webhook pipeline and indexing latency improvements",
+      "relevant_ids": ["d16", "d22"]
+    },
+    {
+      "id": "q50", "category": "multi-hop",
+      "query": "how did the codebase indexing feature develop over time",
+      "relevant_ids": ["d36", "d14", "d50", "d34"]
+    }
+  ]
+}
