@@ -4236,16 +4236,28 @@ async def index_session(
         chunk_id = f'{index_path}:{i}'
         c_hash = hashlib.sha256(chunk['content'].encode()).hexdigest()[:16]
 
+        # Extract event_date for temporal retrieval
+        event_date = extract_event_date(
+            chunk['content'], session_ts=None, file_path=index_path,
+        )
+
+        # Clean up old entities before replace
+        try:
+            conn.execute('DELETE FROM chunk_entities WHERE chunk_id = ?', (chunk_id,))
+        except Exception:
+            pass
+
         conn.execute(
             'INSERT OR REPLACE INTO chunks '
             '(id, file_path, chunk_index, start_line, end_line, '
-            'title, content, embedding, hash, updated_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)',
+            'title, content, embedding, hash, updated_at, event_date) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)',
             (
                 chunk_id, index_path, i,
                 chunk['start_line'], chunk['end_line'],
                 chunk['title'], chunk['content'],
                 c_hash, int(datetime.now().timestamp() * 1000),
+                event_date,
             ),
         )
 
@@ -4261,6 +4273,25 @@ async def index_session(
                 )
             except Exception:
                 pass
+
+        # Extract and store entities for entity-overlap retrieval
+        entities = extract_entities(chunk['content'], chunk['title'])
+        for etype, evalue in entities:
+            conn.execute(
+                'INSERT INTO chunk_entities (chunk_id, entity_type, entity_value) '
+                'VALUES (?, ?, ?)',
+                (chunk_id, etype, evalue),
+            )
+
+        # Extract and store co-occurrence relationships
+        co_occurrences = extract_co_occurrences(entities, chunk_id)
+        for ea, eb, rel_type, cid in co_occurrences:
+            conn.execute(
+                'INSERT INTO entity_relationships '
+                '(entity_a, relation_type, entity_b, chunk_id) '
+                'VALUES (?, ?, ?, ?)',
+                (ea, rel_type, eb, cid),
+            )
 
     # Update files table
     file_hash = hashlib.sha256(
