@@ -326,6 +326,7 @@ def index_codebase(
     incremental: bool = False,
     truncate_dims: int = 0,
     doc_prefix: str = '',
+    throttle: bool = False,
 ) -> dict:
     """Index a codebase into the chunks table."""
     from code_chunker import chunk_file
@@ -353,7 +354,8 @@ def index_codebase(
     total_files = 0
     skipped_files = 0
     batch: list[dict] = []
-    batch_size = 32
+    batch_size = 8 if throttle else 32
+    throttle_delay = 0.5 if throttle else 0
     t0 = time.time()
 
     for i, fpath in enumerate(files):
@@ -423,6 +425,8 @@ def index_codebase(
                 f'{total_chunks} chunks, {elapsed:.1f}s',
                 end='', file=sys.stderr,
             )
+            if throttle_delay > 0:
+                time.sleep(throttle_delay)
 
     # Flush remaining batch
     if batch:
@@ -1225,6 +1229,8 @@ def main():
                         help='Skip repos with fewer than this many tracked files (default: 3)')
     parser.add_argument('--exclude', type=str, default='',
                         help='Comma-separated repo names to skip in batch mode')
+    parser.add_argument('--throttle', action='store_true',
+                        help='Reduce CPU impact: smaller batches + sleep between them (for indexing while working)')
 
     args = parser.parse_args()
 
@@ -1342,6 +1348,7 @@ def main():
                     incremental=False,
                     truncate_dims=truncate_dims,
                     doc_prefix=doc_prefix,
+                    throttle=args.throttle,
                 )
                 write_codebase_model_meta(conn, model_name)
                 _retry_on_locked(conn.commit)
@@ -1402,6 +1409,7 @@ def main():
             incremental=args.update,
             truncate_dims=truncate_dims,
             doc_prefix=doc_prefix,
+            throttle=args.throttle,
         )
         print(f'\nChunk indexing result: {result}')
 
