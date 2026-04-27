@@ -1267,12 +1267,12 @@ def main():
             sys.exit(1)
 
         # Find git repos
-        exclude_set = {x.strip() for x in args.exclude.split(',') if x.strip()}
+        exclude_set = {x.strip().lower() for x in args.exclude.split(',') if x.strip()}
         repos = []
         for entry in sorted(batch_root.iterdir()):
             if not entry.is_dir() or entry.name.startswith('.'):
                 continue
-            if entry.name in exclude_set:
+            if entry.name.lower() in exclude_set:
                 print(f'[batch] SKIP {entry.name} (excluded)', file=sys.stderr)
                 continue
             if not (entry / '.git').exists():
